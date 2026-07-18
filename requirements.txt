@@ -1,0 +1,12 @@
+fastapi==0.116.2
+uvicorn==0.35.0
+httpx==0.28.0
+pydantic==2.11.9
+
+# Docling brings torch + the layout runtime. Pinned to the exact version the
+# parser was validated against (CV: 82 chunks / 82 regions; 3 bulas; a 10-page
+# report) — its doc_item grouping, heading flattening and prov bboxes are what
+# the ancestry rebuild is calibrated to, so drifting the version silently
+# re-chunks every corpus.
+docling==2.102.1
+docling-core>=2.0

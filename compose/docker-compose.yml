@@ -1,0 +1,65 @@
+# The Ingestion Agent — a service, not a per-app image.
+#
+# It is complete and useful on its own: any script, CI job or agent can drive it
+# over its API. The Patron block and the agent_runtime node are clients of that
+# same API, not privileged paths into it.
+services:
+  ingestion-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ingestion-server:0.1.0
+    container_name: ingestion-server
+    environment:
+      # The three services it talks to. Nothing here points at noted.
+      ARCADEDB_URL: "http://graph-server-arcadedb:2480"
+      ARCADEDB_USER: "root"
+      ARCADEDB_PASSWORD: "${ARCADEDB_PASSWORD:-poc-dev-pass}"
+      EMBED_URL: "http://embeddings-server:8600"
+      AGENT_SERVER_URL: "http://agent_server:7701"
+      BUS_URL: "http://agent-bus-app:6815"
+      BUS_ENABLED: "${BUS_ENABLED:-true}"
+      # llama-vision runs `--parallel 2`. Measured: 2 concurrent gives ~1.02s per
+      # chunk sustained; 4 shows a clean two-wave queue and NO throughput gain.
+      # Raise this only if --parallel is raised with it.
+      LLM_PARALLELISM: "${LLM_PARALLELISM:-2}"
+      # A write API to your graph. Empty = open, which is dev-only.
+      API_TOKEN: "${INGESTION_API_TOKEN:-}"
+    volumes:
+      # Run state: a run can suspend on a judge flag and wait hours for a human
+      # decision, so it has to outlive the process.
+      - ./data:/data
+      # Custom layers, mounted and referenced by name (the Skills pattern: the
+      # code lives in the service that owns it; callers hold a reference).
+      - ./data/layers:/data/layers
+      # Models. Read-only — the Agent never writes them.
+      - ${HOME}/env/assets/cv/data/models:/models:ro
+      # The corpora it ingests. Read-only for the same reason.
+      - ${HOME}/env/labs/medical/data:/corpora/bulas:ro
+      # The watched drop folder, at the SAME container path folder_watch sees it.
+      # A File Initiator fires with emit=path, so the seed is "/watched/in/<file>";
+      # the Agent must resolve that exact path to the same bytes folder_watch saw.
+      # Mount folder_watch's own watched dir here, NOT a different host /watched/in.
+      - ${HOME}/env/assets/folder_watch/watched/in:/watched/in:ro
+      # A named volume the CV CI stage writes the freshly-built PDF into, then
+      # ingests by path (/ci_drop/cv.pdf). Shared with the throwaway CI container
+      # on noted-network; nothing else touches it.
+      - cv_ci_drop:/ci_drop:ro
+    ports:
+      - "127.0.0.1:8700:8700"
+    networks:
+      - noted-network        # where graph-server, embeddings-server, agent_server live
+    restart: unless-stopped
+
+networks:
+  noted-network:
+    external: true
+
+volumes:
+  # A FIXED external name (not compose-prefixed) so the CV CI stage's throwaway
+  # `docker run -v cv_ci_drop:/drop` and this service reference the SAME volume.
+  # Compose would otherwise name it "<project>_cv_ci_drop" and the two would
+  # silently be different volumes — the file would land where the Agent can't see it.
+  cv_ci_drop:
+    name: cv_ci_drop
+    external: true
