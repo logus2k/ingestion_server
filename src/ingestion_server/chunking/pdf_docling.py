@@ -844,6 +844,7 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
 
     ancestors = heading_ancestors or {}
     current: str | None = None
+    current_heading_region: dict | None = None   # geometry of `current`'s heading
     n_bullets = 0
 
     for item, _level in doc.iterate_items():
@@ -852,9 +853,27 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
 
         # Track the most recent heading in document order. The tree is flat, so
         # position is the only signal for which section a bullet belongs to.
+        # Also capture the heading's OWN bbox so a citation whose sentence is
+        # about the SECTION (not a bullet) can highlight the title — see the
+        # `role:heading` region prepended to each sub-chunk below.
         if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
             if text:
                 current = text
+                current_heading_region = None
+                for p in (getattr(item, 'prov', None) or []):
+                    page = getattr(p, 'page_no', None)
+                    bb = getattr(p, 'bbox', None)
+                    if page is None or bb is None:
+                        continue
+                    try:
+                        current_heading_region = {
+                            'page_no': int(page),
+                            'bbox': [float(v) for v in bb.as_tuple()],
+                            'role': 'heading',
+                        }
+                        break
+                    except Exception:
+                        current_heading_region = None
             continue
 
         if label != DocItemLabel.LIST_ITEM or not text:
@@ -880,14 +899,23 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
             continue
 
         ctx_text = f'{section_path}\n- {text}' if section_path != '(root)' else f'- {text}'
+        # When the text carries the `section_path\n` breadcrumb as its first
+        # line, prepend the section heading's region so line[0]=breadcrumb pairs
+        # with region[0]=heading and line[1]=bullet pairs with region[1]=bullet.
+        # match_regions() surfaces the heading region ONLY for a citing sentence
+        # about the section (never on a plain click), so normal cert clicks are
+        # unchanged. page_no/bbox stay on the BULLET (the chunk's primary target).
+        bullet_page, bullet_bbox = regions[0]['page_no'], regions[0]['bbox']
+        if current_heading_region and section_path != '(root)':
+            regions = [dict(current_heading_region)] + regions
         out.append(MdChunk(
             doc_path=rel_path or (chunks[0].doc_path if chunks else ''),
             chunk_index=0,                      # renumbered below
             section_path=section_path,
             text=ctx_text,
             token_count=tokenizer.count_tokens(ctx_text),
-            page_no=regions[0]['page_no'],
-            bbox=regions[0]['bbox'],
+            page_no=bullet_page,
+            bbox=bullet_bbox,
             regions=regions,
             section_level=len(chain) or None,
             kind='text',

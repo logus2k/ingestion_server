@@ -109,6 +109,13 @@ class Pipeline(BaseModel):
     # prompt, so one preset serves every corpus. Distinct from the judge's preset
     # — they are different roles.
     extraction_agent: str = "ingest_extractor"
+    # When true, after extraction the engine collapses entities that share a
+    # normalized NAME but were emitted under different TYPES into a single
+    # canonical entity (highest-confidence type wins), re-pointing every edge.
+    # OFF by default: for many corpora the same name legitimately spans types
+    # (e.g. "Deep Learning" as both a technique and a field), so this is opt-in
+    # per pipeline where dual-typing is judged noise rather than signal.
+    merge_cross_type: bool = False
 
     def validate_semantics(self) -> list[str]:
         """Cross-field rules the schema can't express. Human-aimed strings;

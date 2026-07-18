@@ -19,6 +19,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from .chunking import get_chunker
@@ -241,6 +242,10 @@ class Engine:
                     raise _Suspend(f"judge flagged {layer.name}: "
                                    f"{verdict.suspicion or verdict.note}")
 
+        # ── optional cross-type entity reconciliation (opt-in per pipeline) ─
+        if getattr(run.pipeline, "merge_cross_type", False):
+            entities, relations = _reconcile_cross_type(entities, relations)
+
         # ── commit: one atomic write, additions and removals together ─
         self._check_cancel(run)
         t0 = time.time()
@@ -418,6 +423,51 @@ async def _insert(db: Arcade, vtype: str, rows: list[dict]) -> None:
             stmts.append(f"INSERT INTO {vtype} CONTENT :p{k};")
             params[f"p{k}"] = d
         await db.script(stmts, params)
+
+
+def _reconcile_cross_type(entities: dict[str, Entity],
+                          relations: list[Relation]) -> tuple[dict[str, Entity], list[Relation]]:
+    """Collapse entities that share a normalized NAME but were emitted under
+    different TYPES into one canonical entity (highest-confidence type wins),
+    re-pointing every edge and dropping self-loops/duplicates. Pure and
+    domain-agnostic; gated by `pipeline.merge_cross_type`. The normalized name is
+    already the id suffix (`<type>:<normalized name>`)."""
+    by_name: dict[str, list[Entity]] = {}
+    for e in entities.values():
+        key = e.id.split(":", 1)[1] if ":" in e.id else e.id
+        by_name.setdefault(key, []).append(e)
+
+    remap: dict[str, str] = {}                 # merged id -> canonical id
+    new_entities: dict[str, Entity] = {}
+    for group in by_name.values():
+        if len(group) == 1:
+            new_entities[group[0].id] = group[0]
+            continue
+        canonical = max(group, key=lambda e: e.confidence)
+        best_desc = max((g.description or "" for g in group), key=len, default="")
+        canon = replace(canonical, description=best_desc or canonical.description)
+        new_entities[canon.id] = canon
+        for g in group:
+            if g.id != canon.id:
+                remap[g.id] = canon.id
+
+    if not remap:
+        return entities, relations
+
+    new_rels: list[Relation] = []
+    seen: set = set()
+    for r in relations:
+        src, dst = remap.get(r.src, r.src), remap.get(r.dst, r.dst)
+        if src == dst:                          # self-loop created by the merge
+            continue
+        key = (src, dst, r.type)
+        if key in seen:
+            continue
+        seen.add(key)
+        new_rels.append(replace(r, src=src, dst=dst))
+    logger.info("cross-type reconcile: merged %d entity ids (%d -> %d entities)",
+                len(remap), len(entities), len(new_entities))
+    return new_entities, new_rels
 
 
 async def _upsert_entities(db: Arcade, rows: list[dict]) -> None:
