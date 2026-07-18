@@ -43,6 +43,13 @@ def get_chunker(strategy: str) -> Callable[..., list[Chunk]]:
         # not pay that at startup.
         from .pdf_docling_adapter import scan
         return scan
+    if strategy == "structural":
+        # One chunk per document item, un-merged, with a normalized block type in
+        # `kind`. For consumers that need document STRUCTURE rather than retrieval
+        # units (requirement segmentation, faithful reconstruction). Shares the
+        # cached docling converter with pdf_docling — see structural.py.
+        from .structural import scan
+        return scan
     if strategy == "markdown_render":
         raise NotImplementedError(
             "chunking.strategy 'markdown_render' is not implemented yet. It would "

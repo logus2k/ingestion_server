@@ -35,7 +35,9 @@ WORKDIR /app
 # and installing it without its deps resolves to an incompatible starlette that
 # fails at import with "Router.__init__() got an unexpected keyword argument
 # 'on_startup'". The deps are small (starlette, anyio, click).
-RUN pip install --no-cache-dir fastapi==0.116.2 uvicorn==0.35.0
+# python-multipart: required by the stateless /v1/parse endpoint (UploadFile);
+# FastAPI raises at import time without it.
+RUN pip install --no-cache-dir fastapi==0.116.2 uvicorn==0.35.0 python-multipart==0.0.20
 
 COPY src/ /app/src/
 ENTRYPOINT []

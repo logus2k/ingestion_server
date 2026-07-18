@@ -11,12 +11,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
+from dataclasses import asdict
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.responses import StreamingResponse
 
 from . import bus
+from .chunking import get_chunker
 from .config import settings
 from .engine import Engine, new_run
 from .layers.registry import list_layers
@@ -92,6 +96,46 @@ async def validate(pipeline: Pipeline) -> dict:
     fields must be extractable."""
     errors = pipeline.validate_semantics()
     return {"ok": not errors, "errors": errors}
+
+
+@app.post("/v1/parse", tags=["parse"])
+async def parse(file: UploadFile = File(...),
+                strategy: str = "structural",
+                target_tokens: int = 200) -> dict:
+    """Stateless parse: a document in, its blocks out. No corpus, no run, nothing stored.
+
+    A *run* is corpus ingestion — it needs a full pipeline (corpus + chunking + types +
+    index + steps) and `validate_semantics()` rejects a steps-less one ("it would only
+    write chunks"). Consumers that only want the document's STRUCTURE — requirement
+    segmentation, faithful document reconstruction — shouldn't have to create a corpus
+    and an index to get it. Hence this endpoint.
+
+    Upload (not a server-side path) so callers need no shared filesystem with us.
+    Default strategy is `structural`: one block per document item, un-merged, with a
+    normalized `kind` plus page/bbox provenance.
+    """
+    suffix = os.path.splitext(file.filename or "upload")[1] or ".bin"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        tmp.write(await file.read())
+        tmp.close()
+        # Parsing is blocking and model-heavy — keep it off the event loop.
+        chunks = await asyncio.to_thread(get_chunker(strategy), tmp.name, target_tokens)
+    except NotImplementedError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:                      # unknown strategy
+        raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    return {
+        "name": file.filename,
+        "strategy": strategy,
+        "count": len(chunks),
+        "blocks": [asdict(c) for c in chunks],
+    }
 
 
 @app.post("/v1/runs", tags=["runs"], dependencies=[Depends(auth)])

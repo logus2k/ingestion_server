@@ -54,7 +54,10 @@ class Corpus(BaseModel):
 
 
 class Chunking(BaseModel):
-    strategy: Literal["pdf_docling", "markdown_render", "plain_text"] = "pdf_docling"
+    # `structural` emits one chunk per document item (un-merged, block type in
+    # `kind`) for consumers that need document structure rather than retrieval
+    # units — see chunking/structural.py.
+    strategy: Literal["pdf_docling", "markdown_render", "plain_text", "structural"] = "pdf_docling"
     # Docling-style chunkers honour only max_tokens; this is fed to it directly.
     target_tokens: int = 200
 
