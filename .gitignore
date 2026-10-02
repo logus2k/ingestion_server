@@ -1,0 +1,7 @@
+# Python build leftovers
+__pycache__/
+*.pyc
+.venv/
+
+# secrets (ArcadeDB password, API token)
+.env

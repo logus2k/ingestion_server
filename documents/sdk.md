@@ -111,7 +111,14 @@ line and the type vocabulary, nothing else.
 | `pdf_docling` | chunks + per-item bounding boxes (citations can highlight a page) | docling models |
 | `plain_text` | chunks with real heading ancestry, no geometry | nothing |
 
-`target_tokens` is fed to the chunker directly.
+`target_tokens` is fed to the chunker directly, per run (2026-09-30 fix: `pdf_docling` read the environment's
+`CHUNK_TARGET_TOKENS` at import, so a run's own value was ignored and every run chunked at 200).
+
+`context: true` (optional `title`) puts each chunk's `title > section > subsection` as its first line. docling
+keeps headings out of the chunk text (they are only in `section_path`), so a chunk that continues a list
+("e) … f) …") never said what it was about; with the line, it is embedded and reranked with its topic.
+Measured by Cortex on Word procedures: 18 → 22 of 37 questions answered correctly. A custom layer that
+highlights the chunk in the source should match on the text after that line (Cortex's `cortex_kb` does).
 
 ### types
 

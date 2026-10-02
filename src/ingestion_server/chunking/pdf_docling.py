@@ -58,7 +58,10 @@ CHUNK_TARGET_TOKENS = int(os.environ.get('CHUNK_TARGET_TOKENS', '200'))
 
 
 def resolve_chunking_profile(profile_id: str | None = None) -> dict:
-    return {'id': 'list-dense', 'target_tokens': CHUNK_TARGET_TOKENS}
+    # read now, not at import: the adapter sets CHUNK_TARGET_TOKENS per run from the pipeline's
+    # chunking.target_tokens, and the import-time constant ignored every value but the startup one
+    # (measured 2026-09-30: a run asking for 400 got 200)
+    return {'id': 'list-dense', 'target_tokens': int(os.environ.get('CHUNK_TARGET_TOKENS', CHUNK_TARGET_TOKENS))}
 
 
 # ── Inlined from noted's app/scanners/md_scanner.py ───────────────────

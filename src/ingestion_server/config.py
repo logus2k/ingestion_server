@@ -24,7 +24,7 @@ class Settings:
     # ── the corpus ────────────────────────────────────────────────────
     arcadedb_url: str = os.environ.get("ARCADEDB_URL", "http://graph-server-arcadedb:2480").rstrip("/")
     arcadedb_user: str = os.environ.get("ARCADEDB_USER", "root")
-    arcadedb_password: str = os.environ.get("ARCADEDB_PASSWORD", "poc-dev-pass")
+    arcadedb_password: str = os.environ.get("ARCADEDB_PASSWORD", "")
     # ArcadeDB caps HTTP result sets around 20k rows; every read is paginated.
     arcade_page: int = _int("ARCADE_PAGE", 5000)
     # Per-row INSERT ... CONTENT :pN batches inside one sqlscript.

@@ -14,7 +14,7 @@ services:
       # The three services it talks to. Nothing here points at noted.
       ARCADEDB_URL: "http://graph-server-arcadedb:2480"
       ARCADEDB_USER: "root"
-      ARCADEDB_PASSWORD: "${ARCADEDB_PASSWORD:-poc-dev-pass}"
+      ARCADEDB_PASSWORD: "${ARCADEDB_PASSWORD:?set ARCADEDB_PASSWORD in compose/.env}"
       EMBED_URL: "http://embeddings-server:8600"
       AGENT_SERVER_URL: "http://agent_server:7701"
       BUS_URL: "http://agent-bus-app:6815"
@@ -45,6 +45,14 @@ services:
       # ingests by path (/ci_drop/cv.pdf). Shared with the throwaway CI container
       # on noted-network; nothing else touches it.
       - cv_ci_drop:/ci_drop:ro
+      # Cortex's knowledge bases (~/env/assets/diarization, cortex/kbase/): Cortex writes a
+      # PDF into a KB's folder and asks for it by path, so the paths here are the SAME
+      # container paths Cortex uses. Read-only: Cortex owns these folders.
+      - ${HOME}/env/bancoctt/kb:/kb/bancoctt:ro
+      - ${HOME}/env/assets/diarization/kb/corpora:/diarization/kb/corpora:ro
+      # ...and its custom layer (origin/source_path/title on every chunk), owned by
+      # Cortex and referenced by name (`cortex_kb`), per the custom-layers pattern.
+      - ${HOME}/env/assets/diarization/cortex/kbase/ingest_layer/cortex_kb.py:/data/layers/cortex_kb.py:ro
     ports:
       - "127.0.0.1:8700:8700"
     networks:

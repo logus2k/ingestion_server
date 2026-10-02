@@ -60,6 +60,13 @@ class Chunking(BaseModel):
     strategy: Literal["pdf_docling", "markdown_render", "plain_text", "structural"] = "pdf_docling"
     # Docling-style chunkers honour only max_tokens; this is fed to it directly.
     target_tokens: int = 200
+    # Opt-in: each chunk's text starts with "<title> > <section path>" (a line) before it is embedded and
+    # stored. Docling keeps headings out of the chunk text, so a passage whose words never name its subject
+    # (a campaign's conditions under the heading "Campanha TOIC", the second half of a short list) was not
+    # found by search: on 37 questions over 16 Word documents, 18 answers correct without it, 22 with the
+    # section path (Cortex, 2026-09-30). `title`: the document's title (default: none, the path only).
+    context: bool = False
+    title: str | None = None
 
 
 class IndexField(BaseModel):

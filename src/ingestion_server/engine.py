@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 STRUCTURAL = ("markdown_doc", "markdown_chunk", "community", "community_summary")
 
 
+
+def _with_context(chunks: list, title: str | None) -> None:
+    """chunking.context: each chunk's text starts with "<title> > <section path>" (models.Chunking)."""
+    for c in chunks:
+        parts: list[str] = []
+        for p in [title or ""] + (c.section_path or "").split(" > "):
+            p = p.strip()
+            if p and p != "(root)" and p.lower() not in (x.lower() for x in parts):
+                parts.append(p)
+        if parts:
+            c.text = " > ".join(parts) + "\n" + c.text
+
 class Cancelled(Exception):
     """Cooperative cancel — raised between layers, never mid-write."""
 
@@ -161,6 +173,8 @@ class Engine:
             run.pipeline.chunking.target_tokens)
         if not chunks:
             raise _Suspend(f"parse produced 0 chunks from {name}", fatal=True)
+        if run.pipeline.chunking.context:
+            _with_context(chunks, run.pipeline.chunking.title)
         report.layers.append(LayerReport(
             name="parse", state="completed", seconds=round(time.time() - t0, 1),
             digest={"chunks": len(chunks),
