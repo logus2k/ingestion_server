@@ -5,3 +5,6 @@ __pycache__/
 
 # secrets (ArcadeDB password, API token)
 .env
+
+# model files (deploy/install.sh downloads them here; never committed)
+data/models/

@@ -33,7 +33,7 @@ services:
       # code lives in the service that owns it; callers hold a reference).
       - ./data/layers:/data/layers
       # Models. Read-only — the Agent never writes them.
-      - ${HOME}/env/assets/cv/data/models:/models:ro
+      - ../data/models:/models:ro                  # its own (cortex/deploy/install.sh downloads them)
       # The corpora it ingests. Read-only for the same reason.
       - ${HOME}/env/labs/medical/data:/corpora/bulas:ro
       # The watched drop folder, at the SAME container path folder_watch sees it.
