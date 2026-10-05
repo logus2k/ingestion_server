@@ -8,3 +8,6 @@ __pycache__/
 
 # model files (deploy/install.sh downloads them here; never committed)
 data/models/
+
+compose/data/runs.db
+
