@@ -11,3 +11,7 @@ data/models/
 
 compose/data/runs.db
 
+
+# this machine only: its compose override and settings (never committed)
+docker-compose.local.yml
+.env

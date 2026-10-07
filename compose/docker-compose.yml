@@ -41,10 +41,11 @@ services:
       # the Agent must resolve that exact path to the same bytes folder_watch saw.
       # Mount folder_watch's own watched dir here, NOT a different host /watched/in.
       - ${HOME}/env/assets/folder_watch/watched/in:/watched/in:ro
-      # A named volume the CV CI stage writes the freshly-built PDF into, then
-      # ingests by path (/ci_drop/cv.pdf). Shared with the throwaway CI container
-      # on noted-network; nothing else touches it.
-      - cv_ci_drop:/ci_drop:ro
+      # A named volume a CI stage writes a freshly-built document into, then
+      # ingests by path (/ci_drop/<file>). Shared with the throwaway CI container;
+      # nothing else touches it. (A machine whose CI uses another volume - the
+      # original's cv_ci_drop - maps it in an uncommitted docker-compose.local.yml.)
+      - ingest_ci_drop:/ci_drop:ro
       # Cortex's knowledge bases (~/env/assets/cortex, cortex/kbase/): Cortex writes a
       # PDF into a KB's folder and asks for it by path, so the paths here are the SAME
       # container paths Cortex uses. Read-only: Cortex owns these folders.
@@ -56,18 +57,18 @@ services:
     ports:
       - "127.0.0.1:8700:8700"
     networks:
-      - noted-network        # where graph-server, embeddings-server, agent_server live
+      - cortex-kb            # where graph-server, embeddings-server, agent_server live
     restart: unless-stopped
 
 networks:
-  noted-network:
+  cortex-kb:
     external: true
 
 volumes:
-  # A FIXED external name (not compose-prefixed) so the CV CI stage's throwaway
-  # `docker run -v cv_ci_drop:/drop` and this service reference the SAME volume.
-  # Compose would otherwise name it "<project>_cv_ci_drop" and the two would
+  # A FIXED external name (not compose-prefixed) so a CI stage's throwaway
+  # `docker run -v ingest_ci_drop:/drop` and this service reference the SAME volume.
+  # Compose would otherwise name it "<project>_ingest_ci_drop" and the two would
   # silently be different volumes — the file would land where the Agent can't see it.
-  cv_ci_drop:
-    name: cv_ci_drop
+  ingest_ci_drop:
+    name: ingest_ci_drop
     external: true
