@@ -18,8 +18,9 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from . import bus
+from . import bus, gpu_memory
 from .chunking import get_chunker
 from .config import settings
 from .engine import Engine, new_run
@@ -61,6 +62,8 @@ def auth(authorization: Optional[str] = Header(default=None)) -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    from .chunking import pdf_docling
+    gpu_memory.start(pdf_docling._CONVERT_LOCK)
     n = store.reap_orphans()
     if n:
         logger.warning("marked %d orphaned run(s) failed (service restarted mid-run)", n)
@@ -80,6 +83,22 @@ async def healthz() -> dict:
             "arcadedb": settings.arcadedb_url, "embed": settings.embed_url,
             "llm": settings.agent_server_url,
             "layers": [l.name for l in list_layers()]}
+
+
+class GpuMemory(BaseModel):
+    release_when_idle: Optional[bool] = None
+    idle_seconds: Optional[int] = None
+
+
+@app.get("/v1/admin/gpu-memory", tags=["ops"])
+async def gpu_memory_state() -> dict:
+    """The GPU memory this service holds, and whether it gives its free part back when idle (gpu_memory.py)."""
+    return gpu_memory.snapshot()
+
+
+@app.put("/v1/admin/gpu-memory", tags=["ops"], dependencies=[Depends(auth)])
+async def gpu_memory_set(body: GpuMemory) -> dict:
+    return gpu_memory.configure(body.release_when_idle, body.idle_seconds)
 
 
 @app.get("/v1/layers", tags=["pipelines"])

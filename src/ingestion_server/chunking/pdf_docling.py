@@ -365,6 +365,8 @@ def scan_pdf(
                 ocr_used = True
     finally:
         _WORD_SPACE_FACTOR[0] = None
+        from .. import gpu_memory
+        gpu_memory.used()                  # the GPU's idle clock starts again (gpu_memory: idle memory given back)
         _CONVERT_LOCK.release()
 
     page_count = len(getattr(doc, 'pages', []) or [])
