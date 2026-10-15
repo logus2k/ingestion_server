@@ -195,6 +195,13 @@ _OCR_FALLBACK_MIN_CHARS = int(os.environ.get('DOCLING_OCR_FALLBACK_MIN_CHARS', '
 _OCR_FALLBACK_MIN_PER_PAGE = int(os.environ.get('DOCLING_OCR_FALLBACK_MIN_PER_PAGE', '40'))
 # ... and below this share of letters among the visible characters (a font without a Unicode map: glyph numbers)
 _OCR_FALLBACK_MIN_LETTERS = float(os.environ.get('DOCLING_OCR_FALLBACK_MIN_LETTERS', '0.55'))
+# ... and above this SHARE of misdecoded characters (control characters, U+FFFD) in the extraction. Measured 2026-10-15:
+# a full-page OCR finds a little less of a page's words than its text layer (forms 96% -> 92%, 58% -> 42%), so it pays
+# only when the layer is badly damaged (2.4% misdecoded: 957 characters, every word with one unsearchable), not for a
+# form's few bad letters (0.12-0.15%)
+_OCR_FALLBACK_MISDECODED = float(os.environ.get('DOCLING_OCR_FALLBACK_MISDECODED', '0.005'))
+# the OCR retry's page rendering scale (1.0 = 72 dpi)
+_OCR_IMAGES_SCALE = float(os.environ.get('DOCLING_OCR_IMAGES_SCALE', '2.0'))
 
 
 def _get_ocr_converter():
@@ -220,7 +227,9 @@ def _get_ocr_converter():
         # no Unicode map extract as glyph numbers), and by default docling keeps that layer where it exists
         ocr_options=RapidOcrOptions(force_full_page_ocr=True, backend='torch'),   # torch: the engine installed (and on the GPU)
         generate_picture_images=ENABLE_DOC_DESCRIPTIONS,
-        images_scale=2.0 if ENABLE_DOC_DESCRIPTIONS else 1.0,
+        # the retry reads the page itself, small print included: at 1.0 (72 dpi) a form's footer address was not read
+        # at all (2026-10-15); 2.0 reads it
+        images_scale=_OCR_IMAGES_SCALE,
     )
     _ocr_converter = DocumentConverter(
         allowed_formats=[InputFormat.PDF, InputFormat.DOCX,
@@ -313,6 +322,7 @@ def scan_pdf(
     # the parser's word splitting for this document (word_space_factor), the OCR fallback's too
     _CONVERT_LOCK.acquire()
     _WORD_SPACE_FACTOR[0] = word_space_factor
+    ocr_used = False                       # set when the OCR retry produced the document
     try:
         result = _converter.convert(abs_path)
         doc = result.document  # DoclingDocument
@@ -340,12 +350,18 @@ def scan_pdf(
             # _OCR_FALLBACK_MIN_LETTERS of the visible characters
             _vis = [ch for ln in _kept for ch in ln if not ch.isspace()]
             _letters = (sum(1 for ch in _vis if ch.isalpha()) / len(_vis)) if _vis else 1.0
-            if _body < _OCR_FALLBACK_MIN_CHARS or _body / _pages < _OCR_FALLBACK_MIN_PER_PAGE or _letters < _OCR_FALLBACK_MIN_LETTERS:
+            # ... and misdecoded characters: control characters (U+0080-U+009F) or U+FFFD never occur in real text; a
+            # font whose glyphs the parser maps wrongly yields them ("Praça DuÂue de Saldan\x98a": a form's address;
+            # 29 forms and leaflets of two domains, 2026-10-15)
+            _misdecoded = sum(1 for ch in _txt if 0x80 <= ord(ch) <= 0x9F or ch == '\ufffd')
+            if (_body < _OCR_FALLBACK_MIN_CHARS or _body / _pages < _OCR_FALLBACK_MIN_PER_PAGE
+                    or _letters < _OCR_FALLBACK_MIN_LETTERS or _misdecoded > _OCR_FALLBACK_MISDECODED * max(1, len(_txt))):
                 logger.info('scan_pdf: near-empty or unreadable extraction (%d chars, %d without lines repeated on most '
-                            'pages, %d pages, letters %.0f%%) for %s -> retrying with OCR', len(_txt), _body, _pages,
-                            100 * _letters, rel_path)
+                            'pages, %d pages, letters %.0f%%, misdecoded %d) for %s -> retrying with OCR', len(_txt), _body,
+                            _pages, 100 * _letters, _misdecoded, rel_path)
                 result = _get_ocr_converter().convert(abs_path)
                 doc = result.document
+                ocr_used = True
     finally:
         _WORD_SPACE_FACTOR[0] = None
         _CONVERT_LOCK.release()
@@ -595,9 +611,11 @@ def scan_pdf(
     # (Cortex, 2026-10-15: a governance deliberation, 1,512 of its 1,561 characters, indexed as one link line)
     chunks.extend(_picture_text_chunks(doc, page_headings if page_headings is not None else _SlideHeadings(),
                                        covered_refs, _chunker.tokenizer, rel_path, len(chunks)))
-    if page_headings is not None:
-        chunks.extend(_heading_only_chunks(doc, page_headings, chunks,
-                                           _chunker.tokenizer, rel_path))
+    # A heading no chunk carries - a slide's subtitle, or a form's field label with nothing under it ("Titular 2",
+    # "Banco de Destino/ Recetor da conta": Cortex, 2026-10-15, a form's labels were in no passage) - becomes a chunk of
+    # its own, for every PDF: a PDF heading is otherwise only a passage's section path, never its searchable text.
+    chunks.extend(_heading_only_chunks(doc, page_headings if page_headings is not None else _page_headings(doc), chunks,
+                                       _chunker.tokenizer, rel_path, slides=page_headings is not None))
 
     # ── Per-bullet split for list-only chunks ─────────────────────────
     # Docling's HybridChunker bags a whole bulleted list into ONE chunk
@@ -655,6 +673,11 @@ def scan_pdf(
     # chunk fails the WHOLE document's embed (it lands in the graph but never
     # the vector corpus). Hard-split the oversized tail so that can't happen.
     chunks = _split_oversized_chunks(chunks)
+    if ocr_used:
+        chunks = [replace(c, text=_drop_stray_glyphs(c.text)) if any(_is_cjk(ch) for ch in (c.text or '')) else c for c in chunks]
+        chunks = [c for c in chunks if (c.text or '').strip()]
+        for i, c in enumerate(chunks):
+            c.chunk_index = i
 
     logger.info(
         'pdf scan: %s -> %d chunks across %d pages (toc_dropped=%d, ratio=%.2f, captions=%d)',
@@ -736,6 +759,33 @@ def _slide_rollups(chunks: list[MdChunk], tokenizer, page_headings, fragmented_o
     for i, c in enumerate(out):
         c.chunk_index = i
     return out
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (0x3040 <= o <= 0x30FF or 0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF
+            or 0xAC00 <= o <= 0xD7AF or 0x20000 <= o <= 0x2FA1F)
+
+
+def _drop_stray_glyphs(text: str) -> str:
+    """OCR reads an interface icon as a lone CJK character ("Propostas 2026-277 目 Localizar"): one with no CJK
+    neighbour (spaces aside) is dropped. Real CJK text comes in runs and is kept."""
+    if not any(_is_cjk(ch) for ch in text):
+        return text
+    chars = list(text)
+    keep = []
+    for i, ch in enumerate(chars):
+        if _is_cjk(ch):
+            j = i - 1
+            while j >= 0 and chars[j].isspace():
+                j -= 1
+            k = i + 1
+            while k < len(chars) and chars[k].isspace():
+                k += 1
+            if not ((j >= 0 and _is_cjk(chars[j])) or (k < len(chars) and _is_cjk(chars[k]))):
+                continue
+        keep.append(ch)
+    return ' '.join(''.join(keep).split(' ')).replace('  ', ' ')
 
 
 def _split_oversized_chunks(chunks: list[MdChunk]) -> list[MdChunk]:
@@ -950,7 +1000,7 @@ def _slide_chain(page_headings: dict[int, list[str]], page: int | None, heading:
 
 
 def _heading_only_chunks(doc, page_headings: dict[int, list[str]], chunks: list[MdChunk], tokenizer,
-                         rel_path: str) -> list[MdChunk]:
+                         rel_path: str, slides: bool = True) -> list[MdChunk]:
     """One chunk per slide whose headings no chunk carries: a slide with headings but no chunk (its content an
     image), or a heading no text sits under (a cover's subtitle after its only line). The headings under the slide's
     title (or the title alone, when it is all there is), with their boxes as regions."""
@@ -966,9 +1016,20 @@ def _heading_only_chunks(doc, page_headings: dict[int, list[str]], chunks: list[
             if page is not None and bbox is not None:
                 boxes.setdefault((page, _plain_heading(getattr(item, 'text', ''))), {'page_no': page, 'bbox': bbox})
     out: list[MdChunk] = []
+    # what the chunks' TEXT already says (a heading inside a passage's text is searchable already)
+    said: dict[int, str] = {}
+    for c in chunks:
+        said[c.page_no] = said.get(c.page_no, '') + ' ' + (c.text or '')
     for page in sorted(page_headings):
         heads = page_headings[page]
-        if page in carried:
+        if not slides:
+            # any other PDF: only the headings with NOTHING under them - in no chunk's section path (a heading with
+            # content labels that content's passages already) and in no chunk's text: a form's empty field labels.
+            # (Every heading not in the text would add an outline passage per page - SP0222: 52, many alike - that
+            # competes for answer slots without holding an answer.)
+            in_paths = set().union(*carried.values()) if carried else set()
+            missing = [h for h in heads if h and h not in in_paths and h not in said.get(page, '')]
+        elif page in carried:
             missing = [h for h in heads[1:] if h not in carried[page]]
         else:
             missing = heads[1:] or heads[:1]
@@ -989,7 +1050,7 @@ def _heading_only_chunks(doc, page_headings: dict[int, list[str]], chunks: list[
             kind='text',
             caption_for=None,
         ))
-    logger.info('heading-only slide chunks (slides): %d', len(out))
+    logger.info('heading-only chunks (%s): %d', 'slides' if slides else 'headings in no passage', len(out))
     return out
 
 
