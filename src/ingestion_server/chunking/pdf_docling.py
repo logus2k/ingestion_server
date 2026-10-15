@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import re
 
 from dataclasses import dataclass, replace
@@ -103,12 +104,38 @@ _converter = None
 _chunkers: dict[int, object] = {}
 
 
+# docling-parse's word_space_width_factor_for_merge for the conversion running now (scan_pdf's word_space_factor,
+# models.Chunking.word_space_factor); None: docling's own default. Docling builds the parser's settings in a module
+# function without such a parameter, and in its own worker thread ("Stage-preprocess": a context variable set here is
+# not seen there, measured 2026-10-09): _ensure_loaded wraps the function once to read this module's value, and
+# _CONVERT_LOCK runs one conversion at a time, so a conversion never sees another's value.
+_WORD_SPACE_FACTOR: list[float | None] = [None]
+_CONVERT_LOCK = threading.Lock()
+
+
+def _wrap_decode_config() -> None:
+    from docling.backend import docling_parse_backend as dpb
+    original = dpb._make_docling_parse_decode_config
+    if getattr(original, '_ingestion_wrapped', False):
+        return
+
+    def make(*args, **kwargs):
+        config = original(*args, **kwargs)
+        factor = _WORD_SPACE_FACTOR[0]
+        if factor is not None:
+            config.word_space_width_factor_for_merge = factor
+        return config
+    make._ingestion_wrapped = True
+    dpb._make_docling_parse_decode_config = make
+
+
 def _ensure_loaded() -> None:
     """Lazy-init Docling converter. Idempotent. Chunkers are built on
     demand by _get_chunker(max_tokens)."""
     global _converter
     if _converter is not None:
         return
+    _wrap_decode_config()
 
     # Imported lazily so module import is free even when no PDFs are
     # ingested in a given process (e.g. during a markdown-only rebuild).
@@ -164,6 +191,10 @@ _ocr_converter = None
 # A scanned/image PDF extracts to near-empty text when do_ocr is off. Below
 # this many characters we treat the extraction as failed and retry with OCR.
 _OCR_FALLBACK_MIN_CHARS = int(os.environ.get('DOCLING_OCR_FALLBACK_MIN_CHARS', '500'))
+# ... and below this many characters per page on average (headers and footers excluded)
+_OCR_FALLBACK_MIN_PER_PAGE = int(os.environ.get('DOCLING_OCR_FALLBACK_MIN_PER_PAGE', '40'))
+# ... and below this share of letters among the visible characters (a font without a Unicode map: glyph numbers)
+_OCR_FALLBACK_MIN_LETTERS = float(os.environ.get('DOCLING_OCR_FALLBACK_MIN_LETTERS', '0.55'))
 
 
 def _get_ocr_converter():
@@ -182,8 +213,12 @@ def _get_ocr_converter():
     # missing-model error. Leaving it unset lets Docling resolve RapidOCR (and
     # the layout models, already in the HF cache) from their default locations —
     # the config proven to work in the standalone OCR test.
+    from docling.datamodel.pipeline_options import RapidOcrOptions
     pdf_opts = PdfPipelineOptions(
         do_ocr=True,
+        # the whole page, not only its bitmaps: the retry also serves PDFs whose text layer is unreadable (fonts with
+        # no Unicode map extract as glyph numbers), and by default docling keeps that layer where it exists
+        ocr_options=RapidOcrOptions(force_full_page_ocr=True, backend='torch'),   # torch: the engine installed (and on the GPU)
         generate_picture_images=ENABLE_DOC_DESCRIPTIONS,
         images_scale=2.0 if ENABLE_DOC_DESCRIPTIONS else 1.0,
     )
@@ -227,6 +262,8 @@ def scan_pdf(
     progress_writer: Callable[[dict], None] | None = None,
     *,
     chunking_profile_id: str | None = None,
+    slides: bool = False,
+    word_space_factor: float | None = None,
 ) -> list[MdChunk]:
     """Convert one PDF (or DOCX / PPTX / HTML) into MdChunk instances.
 
@@ -244,6 +281,15 @@ def scan_pdf(
     captioning pass to surface live `sub_phase` data + persistent
     `pictures_total` / `tables_total` etc. counters in the KB Monitor.
     Wrapped in try/except so a misbehaving consumer never breaks scanning.
+
+    `slides`: the document is a presentation's PDF, one page per slide
+    (models.Chunking.slides). Section paths then come from each chunk's own
+    slide (_page_headings / _slide_chain), never from the heading rebuild,
+    and the text Docling nests inside pictures gets chunks of its own
+    (_picture_text_chunks). Off by default: the tuned path is unchanged.
+
+    `word_space_factor`: docling-parse's word_space_width_factor_for_merge for
+    this document (models.Chunking.word_space_factor); None keeps docling's.
 
     Raises ValueError if the document exceeds DOCLING_MAX_PAGES (a safety
     cap against runaway uploads).
@@ -264,22 +310,45 @@ def scan_pdf(
     docling_max_tokens = profile['target_tokens']
     _chunker = _get_chunker(docling_max_tokens)
 
-    result = _converter.convert(abs_path)
-    doc = result.document  # DoclingDocument
+    # the parser's word splitting for this document (word_space_factor), the OCR fallback's too
+    _CONVERT_LOCK.acquire()
+    _WORD_SPACE_FACTOR[0] = word_space_factor
+    try:
+        result = _converter.convert(abs_path)
+        doc = result.document  # DoclingDocument
 
-    # Self-healing OCR fallback: scanned/image PDFs extract to near-empty text
-    # when do_ocr is off. Retry THIS doc with OCR (targeted — text PDFs never
-    # pay the OCR cost). Skipped when OCR is already global.
-    if not DOCLING_OCR:
-        try:
-            _txt = (doc.export_to_markdown() or '').strip()
-        except Exception:
-            _txt = ''
-        if len(_txt) < _OCR_FALLBACK_MIN_CHARS:
-            logger.info('scan_pdf: near-empty extraction (%d chars) for %s '
-                        '-> retrying with OCR', len(_txt), rel_path)
-            result = _get_ocr_converter().convert(abs_path)
-            doc = result.document
+        # Self-healing OCR fallback: scanned/image PDFs extract to near-empty text
+        # when do_ocr is off. Retry THIS doc with OCR (targeted — text PDFs never
+        # pay the OCR cost). Skipped when OCR is already global.
+        if not DOCLING_OCR:
+            try:
+                _txt = (doc.export_to_markdown() or '').strip()
+            except Exception:
+                _txt = ''
+            # what counts is the text OF the pages: a line on most pages is a header or footer ("Informação
+            # Interna" on each of 37 image pages of e-mails made 680 characters and passed the 500 test; Cortex,
+            # 2026-10-15), and a long document needs more than 500 characters to be other than near-empty
+            _pages = max(1, len(getattr(doc, 'pages', []) or []))
+            _lines = [ln.strip() for ln in _txt.splitlines() if ln.strip()]
+            _seen: dict[str, int] = {}
+            for ln in _lines:
+                _seen[ln] = _seen.get(ln, 0) + 1
+            _kept = [ln for ln in _lines if not (_pages >= 3 and _seen[ln] >= max(3, _pages // 2))]
+            _body = sum(len(ln) for ln in _kept)
+            # ... and text that is not text: a PDF whose fonts carry no Unicode mapping extracts as glyph numbers
+            # ("/6 /i255 /10 ..."; five deliberations of the governance platform, 2026-10-15) - letters under
+            # _OCR_FALLBACK_MIN_LETTERS of the visible characters
+            _vis = [ch for ln in _kept for ch in ln if not ch.isspace()]
+            _letters = (sum(1 for ch in _vis if ch.isalpha()) / len(_vis)) if _vis else 1.0
+            if _body < _OCR_FALLBACK_MIN_CHARS or _body / _pages < _OCR_FALLBACK_MIN_PER_PAGE or _letters < _OCR_FALLBACK_MIN_LETTERS:
+                logger.info('scan_pdf: near-empty or unreadable extraction (%d chars, %d without lines repeated on most '
+                            'pages, %d pages, letters %.0f%%) for %s -> retrying with OCR', len(_txt), _body, _pages,
+                            100 * _letters, rel_path)
+                result = _get_ocr_converter().convert(abs_path)
+                doc = result.document
+    finally:
+        _WORD_SPACE_FACTOR[0] = None
+        _CONVERT_LOCK.release()
 
     page_count = len(getattr(doc, 'pages', []) or [])
     if DOCLING_MAX_PAGES and page_count > DOCLING_MAX_PAGES:
@@ -318,6 +387,11 @@ def scan_pdf(
     # followed by another heading is a container of the next one), and
     # the section_path computation below uses that map.
     heading_ancestors = _build_heading_hierarchy(doc)
+    # A presentation: each page is a slide and its headings are its own; the
+    # rebuild above would make one slide's heading the parent of the slides
+    # after it ("a heading followed by a heading is a container" crosses pages)
+    page_headings = _page_headings(doc) if slides else None
+    covered_refs: set[str] = set()          # doc items some chunk already holds
 
     chunks: list[MdChunk] = []
     n_toc_dropped = 0
@@ -341,11 +415,17 @@ def scan_pdf(
 
         first_item = raw.meta.doc_items[0] if raw.meta.doc_items else None
         prov = first_item.prov[0] if first_item and first_item.prov else None
+        for it in (raw.meta.doc_items or []):
+            ref = getattr(it, 'self_ref', None)
+            if ref:
+                covered_refs.add(ref)
         raw_headings = list(raw.meta.headings or [])
         # Enrich the heading chain with reconstructed ancestors so the
         # section_path carries the full parent → child path Docling lost.
         direct_heading = raw_headings[-1] if raw_headings else None
-        if direct_heading and direct_heading in heading_ancestors:
+        if page_headings is not None:
+            full_chain = _slide_chain(page_headings, getattr(prov, 'page_no', None), direct_heading)
+        elif direct_heading and direct_heading in heading_ancestors:
             full_chain = heading_ancestors[direct_heading] + raw_headings
         else:
             full_chain = raw_headings
@@ -505,6 +585,20 @@ def scan_pdf(
         ))
         next_idx += 1
 
+    # ── Text inside pictures (presentations) ──────────────────────────
+    # Docling lays a diagram out as a PICTURE whose boxes and labels are its
+    # children; the chunker never walks into pictures, so a slide that says
+    # everything in a diagram had no chunk at all.
+    # Then a slide with only headings (its content an image: "Examples -
+    # Container Diagram") still has no chunk; its headings say what is on it.
+    # Any PDF, not only a presentation: a page printed from a web application keeps its text inside picture items
+    # (Cortex, 2026-10-15: a governance deliberation, 1,512 of its 1,561 characters, indexed as one link line)
+    chunks.extend(_picture_text_chunks(doc, page_headings if page_headings is not None else _SlideHeadings(),
+                                       covered_refs, _chunker.tokenizer, rel_path, len(chunks)))
+    if page_headings is not None:
+        chunks.extend(_heading_only_chunks(doc, page_headings, chunks,
+                                           _chunker.tokenizer, rel_path))
+
     # ── Per-bullet split for list-only chunks ─────────────────────────
     # Docling's HybridChunker bags a whole bulleted list into ONE chunk
     # (each bullet too short on its own to pass min_tokens). The bbox/
@@ -519,7 +613,7 @@ def scan_pdf(
     # which bullet.
     chunks = _split_bullet_chunks(chunks, _chunker.tokenizer, doc=doc,
                                   heading_ancestors=heading_ancestors,
-                                  rel_path=rel_path)
+                                  rel_path=rel_path, slide_headings=page_headings)
 
     # ── Super-parent chunks across sibling subsections ────────────────
     # The per-subsection parent + per-bullet sub-chunks are precise but
@@ -535,7 +629,24 @@ def scan_pdf(
     # the right granularity per query: broad questions favour the
     # super-parent (~all bullets in one place), specific questions still
     # win with the per-bullet sub-chunk.
-    chunks = _add_super_parent_chunks(chunks, _chunker.tokenizer)
+    # (a presentation: one per slide - its title repeats across a chapter's slides)
+    chunks = _add_super_parent_chunks(chunks, _chunker.tokenizer, per_page=page_headings is not None)
+
+    # ── A presentation: the whole slide as one passage too ───────────────
+    # Docling breaks a slide into its text boxes, and the passes above keep
+    # them apart (one per bullet group, each under its own heading chain). A
+    # question about what the slide SAYS then meets fragments of 300-400
+    # characters that rank poorly on their own (Cortex, 2026-10-14: an
+    # 8-slide deck became 43 passages; the slide that answered "what is the
+    # Silver Economy" was six fragments, the one with its bullets scored
+    # -2.5 by the reranker). One passage per slide, its headings once and its
+    # text boxes in reading order, gives the reranker the slide itself; the
+    # fragments stay for precise citations. Junk boxes ("- ·") are dropped.
+    # Any other PDF laid out as boxes (a marketing leaflet, a one-page product sheet) fragments the same way
+    # (Cortex, 2026-10-14: leaflets of 9 passages with 8 under 200 characters): a page whose text chunks are short
+    # gets the same roll-up; a page of long passages (a Word document's rendering) is left alone.
+    chunks = _slide_rollups(chunks, _chunker.tokenizer, page_headings if page_headings is not None else _SlideHeadings(),
+                            fragmented_only=page_headings is None)
 
     # Guarantee no chunk exceeds the embedder. Docling keeps an atomic element
     # (a large table/list) as one chunk, and _add_super_parent_chunks can
@@ -559,6 +670,72 @@ def scan_pdf(
 # pass through untouched.
 _MAX_CHUNK_CHARS = int(os.environ.get('MAX_CHUNK_CHARS', '6000'))
 _CHUNK_SPLIT_OVERLAP = int(os.environ.get('CHUNK_SPLIT_OVERLAP', '400'))
+
+
+def _slide_text(c: MdChunk, heads: list[str]) -> str:
+    """A slide fragment's own words: without the heading lines the passes above prefixed (the slide's chain, or any of
+    its headings), whitespace collapsed."""
+    chain = ' > '.join(heads)
+    lines = []
+    for line in (c.text or '').split('\n'):
+        t = line.strip()
+        if not t or t == chain or t in heads or t == c.section_path:
+            continue
+        lines.append(t)
+    return ' '.join(' '.join(lines).split())
+
+
+FRAGMENT_CHARS = 400          # a page whose text chunks average under this is "fragmented" (a leaflet, a slide)
+
+
+def _slide_rollups(chunks: list[MdChunk], tokenizer, page_headings, fragmented_only: bool = False) -> list[MdChunk]:
+    """One passage per slide (page): its headings once, then the slide's text boxes in reading order, each once (a
+    fragment whose words are already in an earlier one - a roll-up of its siblings - adds nothing); regions = the
+    union. A slide with fewer than two fragments already is one passage. Fragments whose own words are shorter than
+    12 characters (a stray "- ·" box) are dropped from the result as well.
+    fragmented_only (a PDF that is not a presentation): only pages whose text chunks average under FRAGMENT_CHARS get
+    a roll-up - a leaflet's page does, a Word rendering's page of 1,600-character passages does not."""
+    from collections import defaultdict
+
+    by_page: dict = defaultdict(list)
+    kept: list[MdChunk] = []
+    for c in chunks:
+        heads = list(page_headings.get(c.page_no) or []) if c.page_no is not None else []
+        if c.kind == 'text' and c.page_no is not None and len(_slide_text(c, heads)) < 12 and len((c.text or '').strip()) < 40:
+            continue                                     # junk: a box with no words of its own
+        kept.append(c)
+        if c.kind == 'text' and c.page_no is not None:
+            by_page[c.page_no].append(c)
+    extras: list[MdChunk] = []
+    for page in sorted(by_page):
+        heads = list(page_headings.get(page) or [])
+        if fragmented_only and sum(len(c.text or '') for c in by_page[page]) / max(1, len(by_page[page])) >= FRAGMENT_CHARS:
+            continue
+        seen: list[str] = []
+        parts: list[tuple[str, MdChunk]] = []
+        for c in sorted(by_page[page], key=lambda x: x.chunk_index):
+            body = _slide_text(c, heads)
+            key = body.lower()
+            if len(key) < 12 or key in seen or any(k in key for k in seen):
+                continue
+            seen.append(key)
+            parts.append((body, c))
+        if len(parts) < 2:
+            continue
+        text = (' > '.join(heads) + '\n\n' if heads else '') + '\n\n'.join(b for b, _ in parts)
+        if len(text) > _MAX_CHUNK_CHARS:
+            continue
+        regions = [r for _, c in parts for r in (c.regions or [])]
+        extras.append(MdChunk(
+            doc_path=parts[0][1].doc_path, chunk_index=0, section_path=heads[0] if heads else '(root)',
+            text=text, token_count=tokenizer.count_tokens(text), page_no=page,
+            bbox=regions[0]['bbox'] if regions else None, regions=regions or None,
+            section_level=None, kind='text', caption_for=None))
+    logger.info('page roll-ups (%s): %d, junk fragments dropped: %d', 'fragmented pages' if fragmented_only else 'slides', len(extras), len(chunks) - len(kept))
+    out = kept + extras
+    for i, c in enumerate(out):
+        c.chunk_index = i
+    return out
 
 
 def _split_oversized_chunks(chunks: list[MdChunk]) -> list[MdChunk]:
@@ -590,7 +767,7 @@ def _split_oversized_chunks(chunks: list[MdChunk]) -> list[MdChunk]:
 _BULLET_LINE_RE = re.compile(r'^\s*(?:[-*•–]|[•‣◦])\s+\S')
 
 
-def _add_super_parent_chunks(chunks: list[MdChunk], tokenizer) -> list[MdChunk]:
+def _add_super_parent_chunks(chunks: list[MdChunk], tokenizer, per_page: bool = False) -> list[MdChunk]:
     """Emit one extra wide chunk per top-level container heading.
 
     For each unique outermost ancestor (the part of section_path before
@@ -612,10 +789,13 @@ def _add_super_parent_chunks(chunks: list[MdChunk], tokenizer) -> list[MdChunk]:
     chunk_index is renumbered globally so downstream chunk_id stays
     unique. Token count uses the chunker's tokenizer for honest sizing
     even when text concatenation pushes a chunk past the usual target.
+
+    per_page (a presentation): grouped by slide as well - a chapter's title
+    heads several slides, and one chunk across them would cite the first.
     """
     from collections import defaultdict
 
-    groups: dict[str, list[MdChunk]] = defaultdict(list)
+    groups: dict = defaultdict(list)
     for c in chunks:
         if c.kind != 'text' or not c.section_path or ' > ' not in c.section_path:
             continue
@@ -626,10 +806,11 @@ def _add_super_parent_chunks(chunks: list[MdChunk], tokenizer) -> list[MdChunk]:
         if c.text.startswith(c.section_path + '\n'):
             continue
         top = c.section_path.split(' > ', 1)[0]
-        groups[top].append(c)
+        groups[(c.page_no, top) if per_page else top].append(c)
 
     extras: list[MdChunk] = []
-    for top, siblings in groups.items():
+    for key, siblings in groups.items():
+        top = key[1] if per_page else key
         if len(siblings) < 2:
             continue
         combined_text = top + '\n\n' + '\n\n'.join(s.text for s in siblings)
@@ -671,6 +852,186 @@ def _section_depth(text: str) -> int | None:
     """
     m = _SECTION_NUM_RE.match(text or '')
     return len(m.group(1).split('.')) if m else None
+
+
+def _first_prov(item) -> tuple[int | None, list[float] | None]:
+    """An item's first page and box (PDF space), or (None, None)."""
+    for p in (getattr(item, 'prov', None) or []):
+        page, bb = getattr(p, 'page_no', None), getattr(p, 'bbox', None)
+        if page is None:
+            continue
+        try:
+            return int(page), ([float(v) for v in bb.as_tuple()] if bb is not None else None)
+        except Exception:  # noqa: BLE001 — a malformed box must not drop the item
+            return int(page), None
+    return None, None
+
+
+def _plain_heading(text: str | None) -> str:
+    """A slide heading without the symbol-font glyphs (U+F000-U+F0FF, a bullet or a tick drawn by Wingdings) that
+    decks put before it: blank downstream, they read as noise in a section path."""
+    return ''.join(c for c in (text or '') if not 0xF000 <= ord(c) <= 0xF0FF).strip()
+
+
+def _furniture(doc) -> set[str]:
+    """The texts Docling saw as a page's header or footer ("Informação Interna", a slide number). Seen elsewhere as a
+    heading or inside a picture, the same text is still the footer, not content."""
+    return {(getattr(x, 'text', '') or '').strip() for x in (getattr(doc, 'texts', None) or [])
+            if str(getattr(getattr(x, 'content_layer', None), 'value', '')) == 'furniture'}
+
+
+class _SlideHeadings(dict):
+    """page -> its headings in reading order (the first is the slide's title); `aliases`: (page, a heading as Docling
+    split it) -> the heading it is part of (_page_headings)."""
+    def __init__(self):
+        super().__init__()
+        self.aliases: dict[tuple[int, str], str] = {}
+
+
+def _page_headings(doc) -> _SlideHeadings:
+    """A presentation's headings by page (slide), in reading order: the first is the slide's title.
+    Docling makes a heading wrapped onto two lines two headings ("Componentes base de suporte às" / "CJs:", the Canais
+    2.0 deck's slide 13: the passages under the second never named what they list). Two headings next to each other
+    on a slide, nothing between them, the first not ending a sentence, are one heading when they are laid out as one:
+    lines of the same height, the second right under the first, from the same left edge (_wrapped). Never the slide's
+    title and what follows it (a title and its subtitle are two)."""
+    from docling_core.types.doc import DocItemLabel
+
+    furniture = _furniture(doc)
+    out = _SlideHeadings()
+    prev: tuple[int, int, list[float] | None] | None = None   # the item just before, a heading: (page, index, box)
+    for item, _level in doc.iterate_items():
+        is_heading = getattr(item, 'label', None) in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE)
+        text = _plain_heading(getattr(item, 'text', '')) if is_heading else ''
+        page, _bb = _first_prov(item)
+        if not (is_heading and text and page is not None and text not in furniture):
+            prev = None
+            continue
+        heads = out.setdefault(page, [])
+        if (prev and prev[0] == page and prev[1] >= 1 and not heads[prev[1]].endswith(('.', '!', '?', ':', ';'))
+                and _wrapped(prev[2], _bb)):
+            merged = f"{heads[prev[1]]} {text}"
+            for (pg, frag), whole in list(out.aliases.items()):
+                if pg == page and whole == heads[prev[1]]:
+                    out.aliases[(pg, frag)] = merged
+            out.aliases.setdefault((page, heads[prev[1]]), merged)
+            out.aliases[(page, text)] = merged
+            heads[prev[1]] = merged
+            prev = (page, prev[1], _bb)
+            continue
+        heads.append(text)
+        prev = (page, len(heads) - 1, _bb)
+    return out
+
+
+def _wrapped(first: list[float] | None, second: list[float] | None) -> bool:
+    """Two lines of one heading: the same height (within a fifth), the second starting no more than 0.8 of a line
+    below the first (the Canais 2.0 deck's slide 13: 0.61), both from the same left edge (within a line's height). Boxes are [x0, y0, x1, y1], PDF space
+    (y up)."""
+    if not first or not second:
+        return False
+    h1, h2 = first[3] - first[1], second[3] - second[1]
+    if h1 <= 0 or h2 <= 0 or abs(h1 - h2) > 0.2 * max(h1, h2):
+        return False
+    gap = first[1] - second[3]                       # the first's bottom to the second's top
+    return -0.2 * h1 <= gap <= 0.8 * h1 and abs(first[0] - second[0]) <= h1
+
+
+def _slide_chain(page_headings: dict[int, list[str]], page: int | None, heading: str | None) -> list[str]:
+    """A presentation's section path on slide `page`: the slide's title, then `heading` - the one the chunk sits
+    under - when it is another heading of the same slide. A heading from an earlier slide is never carried over."""
+    heads = (page_headings.get(page) or []) if page is not None else []
+    chain = heads[:1]
+    heading = _plain_heading(heading)
+    heading = getattr(page_headings, 'aliases', {}).get((page, heading), heading)     # a part of a wrapped heading
+    if heading and heading in heads[1:]:
+        chain.append(heading)
+    return chain
+
+
+def _heading_only_chunks(doc, page_headings: dict[int, list[str]], chunks: list[MdChunk], tokenizer,
+                         rel_path: str) -> list[MdChunk]:
+    """One chunk per slide whose headings no chunk carries: a slide with headings but no chunk (its content an
+    image), or a heading no text sits under (a cover's subtitle after its only line). The headings under the slide's
+    title (or the title alone, when it is all there is), with their boxes as regions."""
+    from docling_core.types.doc import DocItemLabel
+
+    carried: dict[int, set[str]] = {}               # the headings each slide's chunks already name
+    for c in chunks:
+        carried.setdefault(c.page_no, set()).update((c.section_path or '').split(' > '))
+    boxes: dict[tuple[int, str], dict] = {}
+    for item, _level in doc.iterate_items():
+        if getattr(item, 'label', None) in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
+            page, bbox = _first_prov(item)
+            if page is not None and bbox is not None:
+                boxes.setdefault((page, _plain_heading(getattr(item, 'text', ''))), {'page_no': page, 'bbox': bbox})
+    out: list[MdChunk] = []
+    for page in sorted(page_headings):
+        heads = page_headings[page]
+        if page in carried:
+            missing = [h for h in heads[1:] if h not in carried[page]]
+        else:
+            missing = heads[1:] or heads[:1]
+        if not missing:
+            continue
+        text = ' > '.join(missing)
+        regions = [boxes[(page, h)] for h in missing if (page, h) in boxes] or None
+        out.append(MdChunk(
+            doc_path=rel_path,
+            chunk_index=len(chunks) + len(out),
+            section_path=heads[0],
+            text=text,
+            token_count=tokenizer.count_tokens(text),
+            page_no=page,
+            bbox=regions[0]['bbox'] if regions else None,
+            regions=regions,
+            section_level=None,
+            kind='text',
+            caption_for=None,
+        ))
+    logger.info('heading-only slide chunks (slides): %d', len(out))
+    return out
+
+
+def _picture_text_chunks(doc, page_headings: dict[int, list[str]], covered: set[str], tokenizer,
+                         rel_path: str, start: int) -> list[MdChunk]:
+    """One chunk per picture holding text no chunk has: a diagram's boxes and labels, in reading order, under its
+    slide's path, with the picture's box as its region. Docling nests such text as the picture's children, and
+    iterate_items (so HybridChunker) never walks into pictures (traverse_pictures=False)."""
+    from docling_core.types.doc import DocItemLabel
+
+    furniture = _furniture(doc)
+    out: list[MdChunk] = []
+    for pic in (getattr(doc, 'pictures', None) or []):
+        texts: list[str] = []
+        for item, _level in doc.iterate_items(root=pic, traverse_pictures=True):
+            if item is pic or getattr(item, 'label', None) == DocItemLabel.PICTURE:
+                continue
+            ref = getattr(item, 'self_ref', None)
+            text = (getattr(item, 'text', '') or '').strip()
+            if text and ref not in covered and text not in furniture:
+                texts.append(text)
+                if ref:
+                    covered.add(ref)
+        if not texts:
+            continue
+        page, bbox = _first_prov(pic)
+        text = ' '.join(texts)
+        out.append(MdChunk(
+            doc_path=rel_path,
+            chunk_index=start + len(out),
+            section_path=' > '.join(_slide_chain(page_headings, page, None)) or '(root)',
+            text=text,
+            token_count=tokenizer.count_tokens(text),
+            page_no=page,
+            bbox=bbox,
+            regions=[{'page_no': page, 'bbox': bbox}] if (page and bbox) else None,
+            section_level=None,
+            kind='text',
+            caption_for=None,
+        ))
+    logger.info('picture text chunks: %d', len(out))
+    return out
 
 
 def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
@@ -813,7 +1174,8 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
 
 def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
                          heading_ancestors: dict[str, list[str]] | None = None,
-                         rel_path: str = '') -> list[MdChunk]:
+                         rel_path: str = '',
+                         slide_headings: dict[int, list[str]] | None = None) -> list[MdChunk]:
     """Keep every parent chunk (whole list — rich retrieval signal) and ADD one
     sub-chunk per bullet (single-region, precise highlight target).
 
@@ -836,6 +1198,10 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
     The section_path is prepended to each sub-chunk's text: without it a bare
     "- Machine Learning (Stanford University)" reranks poorly for a query like
     "certifications and qualifications".
+
+    `slide_headings` (a presentation, scan_pdf's `slides`): a bullet's path is
+    its own slide's (_slide_chain), and the heading region joins it only when
+    that heading is on the bullet's slide.
     """
     out: list[MdChunk] = list(chunks)          # every parent survives, untouched
     if doc is None:
@@ -882,9 +1248,6 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
         if label != DocItemLabel.LIST_ITEM or not text:
             continue
 
-        chain = (ancestors.get(current, []) + [current]) if current else []
-        section_path = ' > '.join(chain) or '(root)'
-
         regions = []
         for p in (getattr(item, 'prov', None) or []):
             page = getattr(p, 'page_no', None)
@@ -901,6 +1264,17 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
             # of a sub-chunk. The parent still carries the text.
             continue
 
+        heading_region = current_heading_region
+        if slide_headings is not None:
+            chain = _slide_chain(slide_headings, regions[0]['page_no'], current)
+            if not (heading_region and heading_region['page_no'] == regions[0]['page_no'] and chain
+                    and chain[-1] == getattr(slide_headings, 'aliases', {}).get(
+                        (regions[0]['page_no'], _plain_heading(current)), _plain_heading(current))):
+                heading_region = None
+        else:
+            chain = (ancestors.get(current, []) + [current]) if current else []
+        section_path = ' > '.join(chain) or '(root)'
+
         ctx_text = f'{section_path}\n- {text}' if section_path != '(root)' else f'- {text}'
         # When the text carries the `section_path\n` breadcrumb as its first
         # line, prepend the section heading's region so line[0]=breadcrumb pairs
@@ -909,8 +1283,8 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
         # about the section (never on a plain click), so normal cert clicks are
         # unchanged. page_no/bbox stay on the BULLET (the chunk's primary target).
         bullet_page, bullet_bbox = regions[0]['page_no'], regions[0]['bbox']
-        if current_heading_region and section_path != '(root)':
-            regions = [dict(current_heading_region)] + regions
+        if heading_region and section_path != '(root)':
+            regions = [dict(heading_region)] + regions
         out.append(MdChunk(
             doc_path=rel_path or (chunks[0].doc_path if chunks else ''),
             chunk_index=0,                      # renumbered below

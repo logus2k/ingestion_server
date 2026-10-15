@@ -10,6 +10,16 @@ services:
       dockerfile: Dockerfile
     image: ingestion-server:0.1.0
     container_name: ingestion-server
+    # the GPU (2026-10-15): docling's layout and table models and the OCR retry for image-only PDFs ran on the CPU
+    # (a 37-page PDF of e-mail screenshots took ~10 minutes); the image's torch is a CUDA build, docling picks the
+    # device itself
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       # The three services it talks to. Nothing here points at noted.
       ARCADEDB_URL: "http://graph-server-arcadedb:2480"

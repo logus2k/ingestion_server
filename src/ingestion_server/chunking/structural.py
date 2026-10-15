@@ -99,7 +99,8 @@ def scan(path: str, target_tokens: int = 200) -> list[Chunk]:
 
     pdf_docling._ensure_loaded()          # reuse the cached converter + its config
     converter = pdf_docling._converter
-    doc = converter.convert(path).document
+    with pdf_docling._CONVERT_LOCK:       # one conversion at a time: never under another's word_space_factor
+        doc = converter.convert(path).document
 
     chunks: list[Chunk] = []
     heading_stack: list[tuple[int, str]] = []   # (tree depth, title)

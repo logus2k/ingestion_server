@@ -67,6 +67,21 @@ class Chunking(BaseModel):
     # section path (Cortex, 2026-09-30). `title`: the document's title (default: none, the path only).
     context: bool = False
     title: str | None = None
+    # Opt-in, `pdf_docling` only: the document is a presentation's PDF, one page per slide. Two things change.
+    # A passage's section path is its own slide's: the slide's title, then the heading it sits under on that
+    # slide - never a heading carried over from an earlier slide (the heading rebuild, tuned on a CV, made one
+    # slide's heading the parent of the slides after it, and their titles were lost). And the text Docling nests
+    # inside a picture - a diagram's boxes and labels, where a slide often keeps all it says - gets passages of
+    # its own instead of being dropped (Cortex, 2026-10-09: two slides of a deck and its architecture diagram
+    # had no passage at all).
+    slides: bool = False
+    # Opt-in, `pdf_docling` only: docling-parse's word_space_width_factor_for_merge (docling's own default 0.33). Two
+    # characters closer than this share a word. A typeface with a narrow space - Acto CTT's is 0.16 em, DejaVu Sans'
+    # 0.32 - had its words merged at 0.33 ("C4Model-Conceitoseadoção(HLDeLLD)"); table cells take their text from
+    # these words, so every table set in it lost its spaces. Measured 2026-10-09, word pieces that match their line's
+    # words: Acto CTT documents 0.48-0.92 -> 0.996-0.998 at 0.2, Office documents in other fonts 0.989-0.995 -> 0.993-1.0,
+    # the CV 0.992 -> 0.988 (so not the default). None: docling's default.
+    word_space_factor: float | None = None
 
 
 class IndexField(BaseModel):

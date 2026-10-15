@@ -168,9 +168,15 @@ class Engine:
 
         # ── parse ─────────────────────────────────────────────────────
         t0 = time.time()
+        ch = run.pipeline.chunking
+        extra = {}                                       # pdf_docling's opt-in options (models.Chunking)
+        if ch.strategy == "pdf_docling":
+            if ch.slides:
+                extra["slides"] = True
+            if ch.word_space_factor is not None:
+                extra["word_space_factor"] = ch.word_space_factor
         chunks = await asyncio.to_thread(
-            get_chunker(run.pipeline.chunking.strategy), doc.path,
-            run.pipeline.chunking.target_tokens)
+            get_chunker(ch.strategy), doc.path, ch.target_tokens, **extra)
         if not chunks:
             raise _Suspend(f"parse produced 0 chunks from {name}", fatal=True)
         if run.pipeline.chunking.context:

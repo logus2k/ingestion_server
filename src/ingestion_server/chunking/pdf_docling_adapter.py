@@ -21,13 +21,15 @@ from ..layers.base import Chunk
 from .pdf_docling import scan_pdf
 
 
-def scan(path: str, target_tokens: int = 200) -> list[Chunk]:
+def scan(path: str, target_tokens: int = 200, slides: bool = False,
+         word_space_factor: float | None = None) -> list[Chunk]:
     import os
     # The parser reads its target from the environment (it predates the service's
     # config); set it here so `chunking.target_tokens` in the pipeline wins.
     os.environ["CHUNK_TARGET_TOKENS"] = str(target_tokens)
 
-    raw = scan_pdf(path, repo_root=os.path.dirname(path))
+    # slides: a presentation (models.Chunking.slides) - opt-in, so the tuned default path is unchanged
+    raw = scan_pdf(path, repo_root=os.path.dirname(path), slides=slides, word_space_factor=word_space_factor)
     out: list[Chunk] = []
     for c in raw:
         out.append(Chunk(
