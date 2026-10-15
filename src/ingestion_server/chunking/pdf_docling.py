@@ -326,6 +326,7 @@ def scan_pdf(
     try:
         result = _converter.convert(abs_path)
         doc = result.document  # DoclingDocument
+        _repair_pair_decoding(doc, rel_path)
 
         # Self-healing OCR fallback: scanned/image PDFs extract to near-empty text
         # when do_ocr is off. Retry THIS doc with OCR (targeted — text PDFs never
@@ -786,6 +787,96 @@ def _drop_stray_glyphs(text: str) -> str:
                 continue
         keep.append(ch)
     return ' '.join(''.join(keep).split(' ')).replace('  ', ' ')
+
+
+def _pair_bytes(ch: str) -> str | None:
+    """The two Latin-1 characters a character stands for when the parser read two one-byte codes as one two-byte code
+    ("䉡" = "Ba"), or None when either byte is not a printable character."""
+    o = ord(ch)
+    if not 0x2000 <= o <= 0xFFFF or 0xD800 <= o <= 0xDFFF:
+        return None
+    hi, lo = o >> 8, o & 0xFF
+    if not all(0x20 <= b <= 0x7E or 0xA0 <= b <= 0xFF for b in (hi, lo)):
+        return None
+    return chr(hi) + chr(lo)
+
+
+def _undo_pair_decoding(text: str) -> str:
+    """Text whose letters the parser read two at a time ("䉡湣漠䍔听匮䄮Ⱐ" for "Banco CTT, S.A., ": a legal footer of
+    three account documents, 2026-10-15) back to its letters. Only for a document _pair_decoded_document accepts. A
+    run of such characters (spaces and line breaks inside it kept) is replaced when it has at least 2 of them outside
+    U+2000-U+2BFF (a bullet, a euro sign or an arrow on its own is never a pair) and its letters read as Latin text:
+    70% or more letters, digits and spaces. A lone glyph is left to _drop_stray_glyphs."""
+    if not any(_pair_bytes(ch) for ch in text):
+        return text
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if _pair_bytes(text[i]) is None or ord(text[i]) <= 0x2BFF:
+            out.append(text[i])
+            i += 1
+            continue
+        # the run: pair characters, with spaces between them, from and to one above U+2BFF (a euro sign next to the
+        # run is the document's own: "€\n䉡湣..." read " ¬\nBanco...")
+        j, last = i, i
+        while j < n and (_pair_bytes(text[j]) is not None or text[j] in ' \t\n'):
+            if _pair_bytes(text[j]) is not None and ord(text[j]) > 0x2BFF:
+                last = j
+            j += 1
+        run = text[i:last + 1]
+        pairs = [ch for ch in run if _pair_bytes(ch) is not None]
+        decoded = ''.join(_pair_bytes(ch) or ch for ch in run)
+        latin = sum(1 for ch in decoded if ch.isascii() and (ch.isalnum() or ch == ' ') or ch.isalpha()) / max(1, len(decoded))
+        if sum(1 for ch in pairs if ord(ch) > 0x2BFF) >= 2 and latin >= 0.7:
+            out.append(decoded)
+        else:
+            out.append(run)
+        i = last + 1
+    return ''.join(out)
+
+
+_PAIR_DOCUMENT_SHARE = 0.95
+
+
+def _pair_decoded_document(texts) -> bool:
+    """Whether a document's CJK-range characters are letters read two at a time: then every one of them splits into
+    two printable Latin-1 characters. Measured 2026-10-15: 100% in all 38 documents of six domains that have any
+    (4,484 in one), 43-69% in real Chinese, Japanese and Korean text - a document under _PAIR_DOCUMENT_SHARE is
+    left alone. Private-use characters do not count: a symbol font's bullets (U+F0A7) are always pairs."""
+    wide = pairs = 0
+    for t in texts:
+        for ch in t or '':
+            o = ord(ch)
+            if o > 0x2BFF and not 0xE000 <= o <= 0xF8FF:
+                wide += 1
+                pairs += _pair_bytes(ch) is not None
+    return wide >= 2 and pairs >= _PAIR_DOCUMENT_SHARE * wide
+
+
+def _repair_pair_decoding(doc, rel_path: str) -> None:
+    """_undo_pair_decoding over every text item (headings, paragraphs, list items, the text inside pictures) and every
+    table cell of a converted document, in place, before anything reads them."""
+    cells = [c for table in getattr(doc, 'tables', None) or []
+             for c in getattr(getattr(table, 'data', None), 'table_cells', None) or []]
+    if not _pair_decoded_document([getattr(i, 'text', '') for i in getattr(doc, 'texts', None) or []] + [c.text for c in cells]):
+        return
+    fixed = 0
+    for item in getattr(doc, 'texts', None) or []:
+        for attr in ('text', 'orig'):
+            value = getattr(item, attr, None)
+            if value:
+                new = _undo_pair_decoding(value)
+                if new != value:
+                    setattr(item, attr, new)
+                    fixed += attr == 'text'
+    for cell in cells:
+        if cell.text:
+            new = _undo_pair_decoding(cell.text)
+            if new != cell.text:
+                cell.text = new
+                fixed += 1
+    if fixed:
+        logger.info('scan_pdf: %d text items read two letters per character, restored, in %s', fixed, rel_path)
 
 
 def _split_oversized_chunks(chunks: list[MdChunk]) -> list[MdChunk]:
