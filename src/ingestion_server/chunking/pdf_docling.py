@@ -405,6 +405,8 @@ def scan_pdf(
     # parent/child links from positional cues (a heading immediately
     # followed by another heading is a container of the next one), and
     # the section_path computation below uses that map.
+    if not slides:
+        _drop_running_headers(doc)
     heading_ancestors = _build_heading_hierarchy(doc)
     # A presentation: each page is a slide and its headings are its own; the
     # rebuild above would make one slide's heading the parent of the slides
@@ -445,7 +447,7 @@ def scan_pdf(
         if page_headings is not None:
             full_chain = _slide_chain(page_headings, getattr(prov, 'page_no', None), direct_heading)
         elif direct_heading and direct_heading in heading_ancestors:
-            full_chain = heading_ancestors[direct_heading] + raw_headings
+            full_chain = heading_ancestors.at(direct_heading, getattr(first_item, 'self_ref', None)) + raw_headings
         else:
             full_chain = raw_headings
         section_path = ' > '.join(full_chain) or '(root)'
@@ -753,7 +755,7 @@ def _slide_rollups(chunks: list[MdChunk], tokenizer, page_headings, fragmented_o
             continue
         regions = [r for _, c in parts for r in (c.regions or [])]
         extras.append(MdChunk(
-            doc_path=parts[0][1].doc_path, chunk_index=0, section_path=heads[0] if heads else '(root)',
+            doc_path=parts[0][1].doc_path, chunk_index=0, section_path=' > '.join(_slide_chain(page_headings, page, None)) or '(root)',
             text=text, token_count=tokenizer.count_tokens(text), page_no=page,
             bbox=regions[0]['bbox'] if regions else None, regions=regions or None,
             section_level=None, kind='text', caption_for=None))
@@ -1016,6 +1018,44 @@ def _plain_heading(text: str | None) -> str:
     return ''.join(c for c in (text or '') if not 0xF000 <= ord(c) <= 0xF0FF).strip()
 
 
+RUNNING_TOP = 0.08        # a running header sits in the page's top 8% (SP0222's: 0.042; its real headings 0.11 and lower)
+
+
+def _drop_running_headers(doc) -> int:
+    """A document's title repeated at the top of its pages, which Docling reads as a section heading: made furniture
+    there (as a page header), so the chunker and the heading rebuild skip it. Measured 2026-10-17 on SP0222: "Constituição e
+    Mobilização de Depósito a Prazo" headed 44 of 53 pages at 0.042 of the height, and each one replaced the real heading
+    of the text after it ("INDÍCE > ..." labels); the template's real headings, repeated 20 times, sit at 0.11 or lower.
+    A text counts when it is in the top band on at least 5 pages and a quarter of them; its other occurrences (the
+    cover's title) stay. Returns how many headings were dropped."""
+    from docling_core.types.doc import ContentLayer
+    heights = {k: getattr(getattr(v, 'size', None), 'height', None) for k, v in (getattr(doc, 'pages', None) or {}).items()}
+    tops: dict[str, list] = {}
+    for item, _ in doc.iterate_items():
+        label = str(getattr(item, 'label', '')).lower()
+        text = (getattr(item, 'text', '') or '').strip()
+        if not text or not ('header' in label or 'title' in label):
+            continue
+        p = next(iter(getattr(item, 'prov', None) or []), None)
+        h = heights.get(getattr(p, 'page_no', None)) if p is not None else None
+        if not h or getattr(p, 'bbox', None) is None:
+            continue
+        b = p.bbox
+        top = b.t if str(getattr(b.coord_origin, 'value', b.coord_origin)).upper().startswith('BOTTOM') else h - b.t
+        if (h - top) / h <= RUNNING_TOP:
+            tops.setdefault(text, []).append((p.page_no, item))
+    n = 0
+    for text, seen in tops.items():
+        pages = {pg for pg, _ in seen}
+        if len(pages) >= 5 and len(pages) >= len(heights) / 4:
+            for _, item in seen:
+                item.content_layer = ContentLayer.FURNITURE
+                n += 1
+    if n:
+        logger.info('running headers dropped as headings: %d', n)
+    return n
+
+
 def _furniture(doc) -> set[str]:
     """The texts Docling saw as a page's header or footer ("Informação Interna", a slide number). Seen elsewhere as a
     heading or inside a picture, the same text is still the footer, not content."""
@@ -1029,6 +1069,7 @@ class _SlideHeadings(dict):
     def __init__(self):
         super().__init__()
         self.aliases: dict[tuple[int, str], str] = {}
+        self.chapters: set[str] = set()     # first headings opening three slides or more: a chapter's label
 
 
 def _page_headings(doc) -> _SlideHeadings:
@@ -1064,6 +1105,9 @@ def _page_headings(doc) -> _SlideHeadings:
             continue
         heads.append(text)
         prev = (page, len(heads) - 1, _bb)
+    # chapter labels: a first heading that opens three slides or more is the chapter's, not a slide's title
+    firsts = [h[0] for h in out.values() if h]
+    out.chapters = {t for t in set(firsts) if firsts.count(t) >= 3}
     return out
 
 
@@ -1084,10 +1128,13 @@ def _slide_chain(page_headings: dict[int, list[str]], page: int | None, heading:
     """A presentation's section path on slide `page`: the slide's title, then `heading` - the one the chunk sits
     under - when it is another heading of the same slide. A heading from an earlier slide is never carried over."""
     heads = (page_headings.get(page) or []) if page is not None else []
-    chain = heads[:1]
+    # a chapter's label opening every slide of the chapter ("07. Campos Customizados" over "7.3 Recovery e
+    # Documentation", the Squad Model deck, 2026-10-17): the title is the heading after it, and both are the path
+    lead = 2 if len(heads) > 1 and heads[0] in getattr(page_headings, 'chapters', set()) else 1
+    chain = heads[:lead]
     heading = _plain_heading(heading)
     heading = getattr(page_headings, 'aliases', {}).get((page, heading), heading)     # a part of a wrapped heading
-    if heading and heading in heads[1:]:
+    if heading and heading in heads[lead:]:
         chain.append(heading)
     return chain
 
@@ -1133,7 +1180,7 @@ def _heading_only_chunks(doc, page_headings: dict[int, list[str]], chunks: list[
         out.append(MdChunk(
             doc_path=rel_path,
             chunk_index=len(chunks) + len(out),
-            section_path=heads[0],
+            section_path=' > '.join(_slide_chain(page_headings, page, None)) or heads[0],
             text=text,
             token_count=tokenizer.count_tokens(text),
             page_no=page,
@@ -1188,7 +1235,33 @@ def _picture_text_chunks(doc, page_headings: dict[int, list[str]], covered: set[
     return out
 
 
-def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
+class _Ancestry(dict):
+    """_build_heading_hierarchy's result. As a dict: heading text -> the ancestors of its LAST occurrence (the old
+    view). `by_ref`: each heading OCCURRENCE (its item's self_ref) -> its own ancestors, and `order`: every item's
+    self_ref -> its position in reading order. A text repeats across sections in procedure manuals ("#1 - Contacto do
+    Cliente" under B and under D, "Inputs e fonte" twenty times in SP0222): keyed by text, every occurrence took the
+    last one's ancestry (measured 2026-10-17: B.1's passage labelled "D - Mobilização ... > #1 - Contacto do Cliente")."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_ref: dict[str, list[str]] = {}
+        self.order: dict[str, int] = {}
+        self.heads: dict[str, list[tuple[int, str]]] = {}   # text -> [(position, self_ref)] of its occurrences
+
+    def at(self, heading: str | None, ref: str | None) -> list[str] | None:
+        """The ancestors of `heading` where the item `ref` is: its nearest occurrence at or before it (the heading
+        that item is under); without a position, the text's (the last occurrence's). None: not a known heading."""
+        if not heading or heading not in self:
+            return None
+        pos = self.order.get(ref) if ref else None
+        if pos is not None:
+            before = [r for p, r in self.heads.get(heading, []) if p <= pos]
+            if before:
+                return self.by_ref.get(before[-1], self[heading])
+        return self[heading]
+
+
+def _build_heading_hierarchy(doc) -> _Ancestry:
     """Reconstruct heading ancestry from positional cues.
 
     Docling's PDF backend assigns the same `level` to every section_header
@@ -1222,10 +1295,14 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
     queries that actually matter (cert + role lookups).
     """
     items = []
+    refs: list[str | None] = []
+    labels: list[str] = []
     for item, _depth in doc.iterate_items():
         label = str(getattr(item, 'label', ''))
+        labels.append(label.lower())
         is_h = 'header' in label.lower() or 'title' in label.lower()
         text = (getattr(item, 'text', '') or '').strip()
+        refs.append(getattr(item, 'self_ref', None))
         # Geometry (page, y_top), for the two-column fallback below. y is
         # bottom-left origin, so a LARGER y_top is HIGHER on the page.
         page = y_top = None
@@ -1273,7 +1350,10 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
 
     # For every heading, gather ancestor containers whose range covers
     # it, ordered by position (outermost-first).
-    out: dict[str, list[str]] = {}
+    out = _Ancestry()
+    for i, ref in enumerate(refs):
+        if ref:
+            out.order[ref] = i
     for i, (is_h, text, _pg, _yt) in enumerate(items):
         if not is_h or not text:
             continue
@@ -1289,6 +1369,9 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
         # text just in case of a repeated label).
         ancestors = [a for a in ancestors if a != text]
         out[text] = ancestors
+        if refs[i]:
+            out.by_ref[refs[i]] = ancestors
+            out.heads.setdefault(text, []).append((i, refs[i]))
 
     # ── Two-column geometric fallback ─────────────────────────────────
     # Reading order breaks on multi-column pages: Docling emits the LEFT column
@@ -1303,11 +1386,14 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
     # is assigned to the nearest ALL-CAPS section that sits physically ABOVE it
     # (earlier page, or same page with a higher y_top). Only fills EMPTY ancestry,
     # so it can never disturb a heading the range logic already resolved.
-    caps = [(t, pg, yt) for (h, t, pg, yt) in items
+    # (a heading followed by the document's index is the index's own title - "INDÍCE" - not a section: measured
+    # 2026-10-17 on SP0222, with its running headers gone it became the parent of 114 passages through this fallback)
+    caps = [(t, pg, yt) for k, (h, t, pg, yt) in enumerate(items)
             if h and t and t.isupper() and any(c.isalpha() for c in t)
-            and pg is not None and yt is not None]
-    for (is_h, text, pg, yt) in items:
-        if not is_h or not text or out.get(text) or pg is None or yt is None:
+            and pg is not None and yt is not None
+            and not (k + 1 < len(labels) and 'document_index' in labels[k + 1])]
+    for k, (is_h, text, pg, yt) in enumerate(items):
+        if not is_h or not text or (out.by_ref.get(refs[k]) if refs[k] else out.get(text)) or pg is None or yt is None:
             continue
         if text.isupper():          # a top-level section has no parent
             continue
@@ -1323,6 +1409,8 @@ def _build_heading_hierarchy(doc) -> dict[str, list[str]]:
                 best = (dist, st)
         if best:
             out[text] = [best[1]]
+            if refs[k]:
+                out.by_ref[refs[k]] = [best[1]]
     return out
 
 
@@ -1367,6 +1455,7 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
 
     ancestors = heading_ancestors or {}
     current: str | None = None
+    current_ref: str | None = None
     current_heading_region: dict | None = None   # geometry of `current`'s heading
     n_bullets = 0
 
@@ -1382,6 +1471,7 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
         if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
             if text:
                 current = text
+                current_ref = getattr(item, 'self_ref', None)   # this occurrence (a text repeats across sections)
                 current_heading_region = None
                 for p in (getattr(item, 'prov', None) or []):
                     page = getattr(p, 'page_no', None)
@@ -1426,7 +1516,8 @@ def _split_bullet_chunks(chunks: list[MdChunk], tokenizer, doc=None,
                         (regions[0]['page_no'], _plain_heading(current)), _plain_heading(current))):
                 heading_region = None
         else:
-            chain = (ancestors.get(current, []) + [current]) if current else []
+            found = ancestors.at(current, current_ref) if isinstance(ancestors, _Ancestry) else ancestors.get(current)
+            chain = ((found or []) + [current]) if current else []
         section_path = ' > '.join(chain) or '(root)'
 
         ctx_text = f'{section_path}\n- {text}' if section_path != '(root)' else f'- {text}'

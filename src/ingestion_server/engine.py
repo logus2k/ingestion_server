@@ -560,12 +560,20 @@ async def ensure_schema(db: Arcade) -> None:
         await db.command(f"CREATE PROPERTY RELATES.{p} IF NOT EXISTS {t}")
     await db.command("CREATE INDEX IF NOT EXISTS ON RELATES (type) NOTUNIQUE")
 
-    for ddl in (f'CREATE INDEX ON Chunk (sidx, swt) LSM_SPARSE_VECTOR '
-                f'METADATA {{"dimensions":{settings.sparse_dims},"modifier":"IDF"}}',
-                f'CREATE INDEX ON Chunk (embedding) LSM_VECTOR '
-                f'METADATA {{"dimensions":{settings.embed_dims},"similarity":"COSINE"}}',
-                f'CREATE INDEX ON Entity (embedding) LSM_VECTOR '
-                f'METADATA {{"dimensions":{settings.embed_dims},"similarity":"COSINE"}}'):
+    # the vector indexes take no IF NOT EXISTS: created only when schema:indexes does not list them (each attempt on an
+    # existing one was a 500 "already exists" from ArcadeDB - three per ingested document, 2026-10-17)
+    try:
+        have = {r.get("name") for r in await db.query("SELECT name FROM schema:indexes")}
+    except Exception:
+        have = set()
+    for name, ddl in (("Chunk[sidx,swt]", f'CREATE INDEX ON Chunk (sidx, swt) LSM_SPARSE_VECTOR '
+                                          f'METADATA {{"dimensions":{settings.sparse_dims},"modifier":"IDF"}}'),
+                      ("Chunk[embedding]", f'CREATE INDEX ON Chunk (embedding) LSM_VECTOR '
+                                           f'METADATA {{"dimensions":{settings.embed_dims},"similarity":"COSINE"}}'),
+                      ("Entity[embedding]", f'CREATE INDEX ON Entity (embedding) LSM_VECTOR '
+                                            f'METADATA {{"dimensions":{settings.embed_dims},"similarity":"COSINE"}}')):
+        if name in have:
+            continue
         try:
             await db.command(ddl)
         except Exception as e:
