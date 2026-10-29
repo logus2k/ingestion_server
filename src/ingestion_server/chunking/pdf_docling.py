@@ -101,7 +101,7 @@ _converter = None
 # process. The chunker constructor itself is cheap; the expensive bit is
 # tokenizer init (bge-m3), which happens once per max_tokens value. With
 # 4 profiles in the catalog, the cache holds at most 4 entries.
-_chunkers: dict[int, object] = {}
+_chunkers: dict[tuple, object] = {}
 
 
 # docling-parse's word_space_width_factor_for_merge for the conversion running now (scan_pdf's word_space_factor,
@@ -200,6 +200,10 @@ _OCR_FALLBACK_MIN_LETTERS = float(os.environ.get('DOCLING_OCR_FALLBACK_MIN_LETTE
 # only when the layer is badly damaged (2.4% misdecoded: 957 characters, every word with one unsearchable), not for a
 # form's few bad letters (0.12-0.15%)
 _OCR_FALLBACK_MISDECODED = float(os.environ.get('DOCLING_OCR_FALLBACK_MISDECODED', '0.005'))
+# ... a document that is only SHORT (its text layer otherwise sound) keeps that layer unless the OCR finds at least this
+# many times its characters: a one-page PDF of 219 characters, letters 91%, was replaced by its OCR, which wrote
+# "clientes" for "Clientes" (Cortex, an attached regulation, 2026-10-28) - a scan with a stray line still gains far more
+_OCR_SHORT_GAIN = float(os.environ.get('DOCLING_OCR_SHORT_GAIN', '1.5'))
 # the OCR retry's page rendering scale (1.0 = 72 dpi)
 _OCR_IMAGES_SCALE = float(os.environ.get('DOCLING_OCR_IMAGES_SCALE', '2.0'))
 
@@ -240,12 +244,14 @@ def _get_ocr_converter():
     return _ocr_converter
 
 
-def _get_chunker(max_tokens: int):
+def _get_chunker(max_tokens: int, tables: str | None = None):
     """Return a HybridChunker for the given max_tokens, cached for the
     lifetime of the process. Tokenizer init (bge-m3) is the expensive
     part; for the small set of distinct profile max_tokens values in
-    practice (4 today) we accept paying it once per value."""
-    chunker = _chunkers.get(max_tokens)
+    practice (4 today) we accept paying it once per value.
+    `tables`: "markdown" writes each table as Markdown rows (models.Chunking.tables); None: docling's triples."""
+    key = (max_tokens, tables or None)
+    chunker = _chunkers.get(key)
     if chunker is not None:
         return chunker
     from docling.chunking import HybridChunker
@@ -255,14 +261,65 @@ def _get_chunker(max_tokens: int):
     # restart for the tokenizer config files even though the full model
     # is on disk.
     bge_m3_local = BGE_M3_LOCAL
+    options = {'serializer_provider': _named_row_triplets()}
+    if tables == 'markdown':
+        from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
+        from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
+
+        class _MarkdownTables(ChunkingSerializerProvider):
+            def get_serializer(self, doc):
+                return ChunkingDocSerializer(doc=doc, table_serializer=MarkdownTableSerializer())
+        options = {'serializer_provider': _MarkdownTables(), 'repeat_table_header': True}
     chunker = HybridChunker(
         tokenizer=bge_m3_local if os.path.isdir(bge_m3_local) else 'BAAI/bge-m3',
         max_tokens=max_tokens,
         merge_peers=True,
+        **options,
     )
-    _chunkers[max_tokens] = chunker
-    logger.info('HybridChunker built: tokenizer=bge-m3 max_tokens=%d', max_tokens)
+    _chunkers[key] = chunker
+    logger.info('HybridChunker built: tokenizer=bge-m3 max_tokens=%d tables=%s', max_tokens, tables or 'triplets')
     return chunker
+
+
+def _rows_named(item):
+    """The table with its first column's name put before each row's label. Docling's triples name a row by its first
+    cell alone and never write that column's name ("1100, Meaning = Authorization Request"): a question about "the MTI"
+    lost the table. Measured 2026-10-29 with the reranker on Finastra's MTI rows: "MTI 1100, Meaning = ..." scored 4.14
+    against 0.83 without the name (POS authorization MTIs) and 4.52 against 2.96 (MTIs 1200/1210/1400), above a header
+    line before the rows (2.73, 3.95). Tables without a header that names columns, or of one column, are returned as
+    they are."""
+    grid = item.data.grid
+    heads = 0
+    for row in grid:
+        if not any(c.column_header for c in row):
+            break
+        heads += 1
+    if not heads or item.data.num_cols < 2 or heads >= item.data.num_rows:
+        return item
+    if not _header_like(list({id(c): c for c in grid[heads - 1]}.values())):
+        return item                     # a data row Docling took for the header ("P15 | Settlement Date | 6 | ...")
+    name = grid[heads - 1][0].text.strip()
+    named = item.model_copy(deep=True)
+    for cell in named.data.table_cells:
+        if cell.start_col_offset_idx == 0 and cell.start_row_offset_idx >= heads and not cell.column_header \
+                and (cell.text or '').strip():
+            cell.text = f'{name} {cell.text.strip()}'
+    return named
+
+
+def _named_row_triplets():
+    """The chunker's serializers with docling's table triples, each row named by its first column (_rows_named)."""
+    from docling_core.transforms.chunker.hierarchical_chunker import (
+        ChunkingDocSerializer, ChunkingSerializerProvider, TripletTableSerializer)
+
+    class _NamedRows(TripletTableSerializer):
+        def serialize(self, *, item, doc_serializer, doc, **kwargs):
+            return super().serialize(item=_rows_named(item), doc_serializer=doc_serializer, doc=doc, **kwargs)
+
+    class _Provider(ChunkingSerializerProvider):
+        def get_serializer(self, doc):
+            return ChunkingDocSerializer(doc=doc, table_serializer=_NamedRows())
+    return _Provider()
 
 
 def scan_pdf(
@@ -273,6 +330,7 @@ def scan_pdf(
     chunking_profile_id: str | None = None,
     slides: bool = False,
     word_space_factor: float | None = None,
+    tables: str | None = None,
 ) -> list[MdChunk]:
     """Convert one PDF (or DOCX / PPTX / HTML) into MdChunk instances.
 
@@ -317,7 +375,7 @@ def scan_pdf(
     # max).
     profile = resolve_chunking_profile(chunking_profile_id)
     docling_max_tokens = profile['target_tokens']
-    _chunker = _get_chunker(docling_max_tokens)
+    _chunker = _get_chunker(docling_max_tokens, tables)
 
     # the parser's word splitting for this document (word_space_factor), the OCR fallback's too
     _CONVERT_LOCK.acquire()
@@ -355,14 +413,26 @@ def scan_pdf(
             # font whose glyphs the parser maps wrongly yields them ("Praça DuÂue de Saldan\x98a": a form's address;
             # 29 forms and leaflets of two domains, 2026-10-15)
             _misdecoded = sum(1 for ch in _txt if 0x80 <= ord(ch) <= 0x9F or ch == '\ufffd')
-            if (_body < _OCR_FALLBACK_MIN_CHARS or _body / _pages < _OCR_FALLBACK_MIN_PER_PAGE
-                    or _letters < _OCR_FALLBACK_MIN_LETTERS or _misdecoded > _OCR_FALLBACK_MISDECODED * max(1, len(_txt))):
+            _damaged = (_body / _pages < _OCR_FALLBACK_MIN_PER_PAGE or _letters < _OCR_FALLBACK_MIN_LETTERS
+                        or _misdecoded > _OCR_FALLBACK_MISDECODED * max(1, len(_txt)))
+            if _damaged or _body < _OCR_FALLBACK_MIN_CHARS:
                 logger.info('scan_pdf: near-empty or unreadable extraction (%d chars, %d without lines repeated on most '
                             'pages, %d pages, letters %.0f%%, misdecoded %d) for %s -> retrying with OCR', len(_txt), _body,
                             _pages, 100 * _letters, _misdecoded, rel_path)
-                result = _get_ocr_converter().convert(abs_path)
-                doc = result.document
-                ocr_used = True
+                ocr_doc = _get_ocr_converter().convert(abs_path).document
+                if _damaged:
+                    doc, ocr_used = ocr_doc, True
+                else:                       # only short: the OCR must find text the layer lacks
+                    try:
+                        _ocr_chars = len(''.join((ocr_doc.export_to_markdown() or '').split()))
+                    except Exception:
+                        _ocr_chars = 0
+                    _layer_chars = len(''.join(_txt.split()))
+                    if _ocr_chars >= _OCR_SHORT_GAIN * _layer_chars:
+                        doc, ocr_used = ocr_doc, True
+                    else:
+                        logger.info('scan_pdf: kept the text layer of %s: short but sound, and the OCR found no more '
+                                    'text (%d characters vs %d)', rel_path, _ocr_chars, _layer_chars)
     finally:
         _WORD_SPACE_FACTOR[0] = None
         from .. import gpu_memory
@@ -407,6 +477,7 @@ def scan_pdf(
     # the section_path computation below uses that map.
     if not slides:
         _drop_running_headers(doc)
+    _name_table_columns(doc)
     heading_ancestors = _build_heading_hierarchy(doc)
     # A presentation: each page is a slide and its headings are its own; the
     # rebuild above would make one slide's heading the parent of the slides
@@ -1053,6 +1124,68 @@ def _drop_running_headers(doc) -> int:
                 n += 1
     if n:
         logger.info('running headers dropped as headings: %d', n)
+    return n
+
+
+HEADER_WORDS = 4           # a column name is short: "Field Description", "Product Version"
+
+
+def _header_like(cells: list) -> bool:
+    """A first row that names columns: every cell filled, none a number ("1.", "1.1", "24"), none longer than a few
+    words ("Identify from clearing file ..." is a value)."""
+    for c in cells:
+        text = (c.text or '').strip()
+        if not text or len(text.split()) > HEADER_WORDS:
+            return False
+        if text.replace('.', '').replace(',', '').replace(' ', '').isdigit():
+            return False
+    return True
+
+
+def _name_table_columns(doc) -> int:
+    """Tables Docling left without a header row are written by the triplet serializer with their column NUMBERS as
+    names ("1100, 1 = Authorization Request"), so a passage loses what each value is. Measured 2026-10-29 on Finastra's
+    ISO 8583 guide: 18 of 84 tables had no header; the reranker scored the MTI rows written that way well below the
+    same rows with their names. Two repairs, in document order:
+      - the first row names the columns ("MTI | Meaning | Usage", "Field Name | Field Description"): marked as header;
+      - the first row is data and the table before it, on this page or the one before, has the same columns and a
+        header that itself names columns: a continuation cut by the page break ("1120 | Authorization Advice | ..."),
+        which gets that header (not a data row Docling took for a header: "P15 | Settlement Date | 6 | ...").
+    Contents lists ("1. | Introduction | 5") stay as they are. Returns how many tables were repaired."""
+    from docling_core.types.doc import TableCell
+    n = 0
+    prev = None
+    for table in getattr(doc, 'tables', None) or []:
+        data = table.data
+        cells = data.table_cells
+        page = next(iter(table.prov or []), None)
+        page = getattr(page, 'page_no', None)
+        if data.num_cols > 1 and data.num_rows > 0 and not any(c.column_header for c in cells):
+            first = [c for c in cells if c.start_row_offset_idx == 0]
+            if len(first) == data.num_cols and _header_like(first):
+                for c in first:
+                    c.column_header = True
+                n += 1
+            elif prev is not None and prev[0] == data.num_cols and prev[1] and _header_like(prev[1]) \
+                    and page is not None and prev[2] is not None and 0 <= page - prev[2] <= 1:
+                rows = len({c.start_row_offset_idx for c in prev[1]})
+                for c in cells:
+                    c.start_row_offset_idx += rows
+                    c.end_row_offset_idx += rows
+                cells[:0] = [TableCell(text=c.text, column_header=True, start_row_offset_idx=c.start_row_offset_idx,
+                                       end_row_offset_idx=c.end_row_offset_idx, start_col_offset_idx=c.start_col_offset_idx,
+                                       end_col_offset_idx=c.end_col_offset_idx, row_span=c.row_span, col_span=c.col_span)
+                             for c in prev[1]]
+                data.num_rows += rows
+                n += 1
+        header = {}                         # a cell spanning rows or columns sits in several places of the grid
+        for row in data.grid:
+            if not any(c.column_header for c in row):
+                break
+            header.update((id(c), c) for c in row)
+        prev = (data.num_cols, list(header.values()), page)
+    if n:
+        logger.info('tables given column names: %d', n)
     return n
 
 

@@ -82,6 +82,12 @@ class Chunking(BaseModel):
     # words: Acto CTT documents 0.48-0.92 -> 0.996-0.998 at 0.2, Office documents in other fonts 0.989-0.995 -> 0.993-1.0,
     # the CV 0.992 -> 0.988 (so not the default). None: docling's default.
     word_space_factor: float | None = None
+    # Opt-in, `pdf_docling` only: how a table is written into its passages. None: docling's own triples ("<row>, <column>
+    # = <value>."), which for a table without a recognised header row name the columns by number ("1100, 1 =
+    # Authorization Request." - an ISO 8583 guide's MTI table, Cortex 2026-10-28) and cut rows across passages;
+    # "markdown": the table's rows as Markdown (a header row, then one line per row, the header repeated when a table
+    # spans passages).
+    tables: str | None = None
 
 
 class IndexField(BaseModel):

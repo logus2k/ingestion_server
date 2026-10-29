@@ -120,7 +120,8 @@ async def validate(pipeline: Pipeline) -> dict:
 @app.post("/v1/parse", tags=["parse"])
 async def parse(file: UploadFile = File(...),
                 strategy: str = "structural",
-                target_tokens: int = 200) -> dict:
+                target_tokens: int = 200,
+                tables: str | None = None) -> dict:
     """Stateless parse: a document in, its blocks out. No corpus, no run, nothing stored.
 
     A *run* is corpus ingestion — it needs a full pipeline (corpus + chunking + types +
@@ -139,7 +140,9 @@ async def parse(file: UploadFile = File(...),
         tmp.write(await file.read())
         tmp.close()
         # Parsing is blocking and model-heavy — keep it off the event loop.
-        chunks = await asyncio.to_thread(get_chunker(strategy), tmp.name, target_tokens)
+        # tables: pdf_docling's table writing (models.Chunking.tables), for a caller that asks
+        extra = {"tables": tables} if tables and strategy == "pdf_docling" else {}
+        chunks = await asyncio.to_thread(get_chunker(strategy), tmp.name, target_tokens, **extra)
     except NotImplementedError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except ValueError as e:                      # unknown strategy

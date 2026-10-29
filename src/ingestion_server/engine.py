@@ -175,6 +175,8 @@ class Engine:
                 extra["slides"] = True
             if ch.word_space_factor is not None:
                 extra["word_space_factor"] = ch.word_space_factor
+            if ch.tables:
+                extra["tables"] = ch.tables
         chunks = await asyncio.to_thread(
             get_chunker(ch.strategy), doc.path, ch.target_tokens, **extra)
         if not chunks:
