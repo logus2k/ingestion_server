@@ -812,12 +812,20 @@ def _slide_rollups(chunks: list[MdChunk], tokenizer, page_headings, fragmented_o
             continue
         seen: list[str] = []
         parts: list[tuple[str, MdChunk]] = []
+        last = None
         for c in sorted(by_page[page], key=lambda x: x.chunk_index):
             body = _slide_text(c, heads)
             key = body.lower()
             if len(key) < 12 or key in seen or any(k in key for k in seen):
                 continue
             seen.append(key)
+            if fragmented_only:
+                # a document page has no slide headings: each fragment's own heading where it changes, or the page's
+                # sections run together (the SWIFT guide's MT 202 table and "MT110 - Advice of Cheques", 2026-10-29)
+                head = (c.section_path or '').split(' > ')[-1]
+                if head and head != '(root)' and head != last:
+                    body = f'{head}\n{body}'
+                last = head
             parts.append((body, c))
         if len(parts) < 2:
             continue
@@ -1029,7 +1037,15 @@ def _add_super_parent_chunks(chunks: list[MdChunk], tokenizer, per_page: bool = 
         top = key[1] if per_page else key
         if len(siblings) < 2:
             continue
-        combined_text = top + '\n\n' + '\n\n'.join(s.text for s in siblings)
+        # each subsection's own heading where it starts: a chunk's text never holds its heading, and stitched without
+        # them the subsections ran together - Finastra's SWIFT guide had "MT110 - Advice of Cheques"'s text read as the
+        # MT 202 table's before it, and an answer said "MT202 is used to notify ... cheques" (2026-10-29)
+        parts, last = [top], None
+        for s in siblings:
+            head = s.section_path.split(' > ')[-1]
+            parts.append(s.text if head == last else f'{head}\n{s.text}')
+            last = head
+        combined_text = '\n\n'.join(parts)
         combined_regions: list[dict] = []
         for s in siblings:
             for r in (s.regions or []):
