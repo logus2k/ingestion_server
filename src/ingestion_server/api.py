@@ -101,6 +101,14 @@ async def gpu_memory_set(body: GpuMemory) -> dict:
     return gpu_memory.configure(body.release_when_idle, body.idle_seconds)
 
 
+@app.post("/v1/admin/gpu-memory/release", tags=["ops"], dependencies=[Depends(auth)])
+async def gpu_memory_release() -> dict:
+    """The free blocks handed back now, not after `idle_seconds` (Cortex's GPU ledger, before a Movies render: its
+    register #171). The models stay loaded. ok=false while a conversion runs (it holds the lock): nothing given back."""
+    freed = await asyncio.to_thread(gpu_memory.release, True)
+    return {"ok": freed is not None, "freed_mib": round(freed or 0.0), **gpu_memory.snapshot()}
+
+
 @app.get("/v1/layers", tags=["pipelines"])
 async def layers() -> dict:
     """Built-in tiers plus any custom layer mounted in `layers_dir` — the

@@ -10,13 +10,13 @@
 #                            the actual embedding runs in embeddings-server, so
 #                            the 4.3GB of weights are not needed here.
 # Base: the image that already carries the heavy, slow-moving half — docling
-# 2.102.1, torch, and the headless-opencv fix (docling pulls opencv-python, which
-# links against X11 that a slim image doesn't have; it fails at import with
-# "libxcb.so.1: cannot open shared object file").
+# 2.102.1, torch, and the headless-opencv fix — built from Dockerfile.base
+# (every package pinned: base-requirements.lock). Build it first:
+#   docker build -f Dockerfile.base -t ingestion-server-base:docling2.102.1-torch2.13.0 .
 #
 # Reinstalling those from scratch re-downloads torch for no reason. Only the
 # service's own deps are added on top.
-ARG BASE_IMAGE=logus2k/cv-ingest:test
+ARG BASE_IMAGE=ingestion-server-base:docling2.102.1-torch2.13.0
 FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -10,6 +10,8 @@ The release takes the conversion lock without waiting (pdf_docling._CONVERT_LOCK
 
     GET  /v1/admin/gpu-memory   {release_when_idle, idle_seconds, reserved_mib, allocated_mib, released_mib}
     PUT  /v1/admin/gpu-memory   {release_when_idle?, idle_seconds?}   (bearer token, as the other write routes)
+    POST /v1/admin/gpu-memory/release   the free blocks given back now {ok, freed_mib, ...} (bearer token; Cortex's GPU
+                                        ledger before a Movies render; ok=false during a conversion)
 Defaults from the environment: GPU_RELEASE_IDLE (true), GPU_RELEASE_IDLE_SECONDS (120). Cortex sets them from its
 settings (Settings > Transcription, "GPU memory").
 """
@@ -64,8 +66,9 @@ def configure(release_when_idle: bool | None = None, idle_seconds: int | None = 
     return snapshot()
 
 
-def release() -> float | None:
-    """Hand the free blocks back; None when a conversion holds the lock (tried again later). MiB given back."""
+def release(asked: bool = False) -> float | None:
+    """Hand the free blocks back; None when a conversion holds the lock (tried again later). MiB given back. `asked`:
+    by POST /v1/admin/gpu-memory/release (Cortex's GPU ledger), not by the idle clock."""
     t = _torch()
     if t is None:
         _released[0] = True
@@ -83,8 +86,8 @@ def release() -> float | None:
             lock.release()
     _released[0] = True
     _total_released_mib[0] += max(0.0, freed)
-    logger.info("gpu memory: idle %d s, %.0f MiB given back to the card (%.0f MiB still reserved)",
-                time.monotonic() - _last_use[0], freed, t.cuda.memory_reserved() / 2**20)
+    logger.info("gpu memory: %s, %.0f MiB given back to the card (%.0f MiB still reserved)",
+                "asked" if asked else f"idle {time.monotonic() - _last_use[0]:.0f} s", freed, t.cuda.memory_reserved() / 2**20)
     return freed
 
 

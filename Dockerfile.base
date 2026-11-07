@@ -1,0 +1,19 @@
+# ingestion-server's base: Python, docling and torch - the heavy, slow-moving half the app image (Dockerfile) adds its
+# few API packages to. Its own since 2026-11-05 (Cortex's register #175): the base it used before, logus2k/cv-ingest:test
+# (the cv project's CI image), was gone from this machine and pinned only docling, so a rebuild could drift torch or
+# docling-core and silently re-chunk every corpus.
+#
+# base-requirements.lock is `pip freeze` of the image that ran until then (docling 2.102.1, docling-core 2.87.1,
+# torch 2.13.0 - PyPI's CUDA 13.0 build -, opencv-python-headless 5.0.0.93, 124 packages), installed with --no-deps:
+# exactly that set, nothing resolved again. opencv-python-headless instead of docling's opencv-python: the latter links
+# against X11 (libxcb/libGL), which a slim image lacks ("libxcb.so.1: cannot open shared object file" at import).
+#
+# Build (once, and when a pin changes):
+#   docker build -f Dockerfile.base -t ingestion-server-base:docling2.102.1-torch2.13.0 .
+FROM python:3.12.13-slim-trixie
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+COPY base-requirements.lock /tmp/base-requirements.lock
+RUN pip install --no-cache-dir --no-deps -r /tmp/base-requirements.lock && rm /tmp/base-requirements.lock \
+    && python -c "import docling, torch, cv2; print('docling ok, torch', torch.__version__, 'cv2', cv2.__version__)"
