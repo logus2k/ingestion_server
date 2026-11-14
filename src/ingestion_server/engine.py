@@ -351,10 +351,15 @@ class Engine:
         mentioned by documents that still exist. Removing entities wholesale
         would corrupt the graph for every other document.
         """
-        before = await db.query("SELECT count(*) AS n FROM Chunk WHERE source_path = :p",
+        # Only rows still at this server's address (source_path = the run's name, no `origin`). A caller's layer that
+        # re-addresses its rows - Cortex's cortex_kb sets origin + the path INSIDE it - owns and removes them itself;
+        # matched by source_path alone, such a row was ANOTHER document's whenever its inner path equalled this name
+        # (Cortex unit A holding "B/x.pdf", unit B holding "x.pdf": uploading or deleting B's erased A's - 2026-11-10,
+        # 447 passages of two documents; Cortex register #384).
+        before = await db.query("SELECT count(*) AS n FROM Chunk WHERE source_path = :p AND origin IS NULL",
                                 {"p": name})
         n_chunks = (before[0]["n"] if before else 0) or 0
-        await db.command("DELETE FROM Chunk WHERE source_path = :p", {"p": name})
+        await db.command("DELETE FROM Chunk WHERE source_path = :p AND origin IS NULL", {"p": name})
         # The parameter must NOT be called `:like` — LIKE is a reserved keyword and
         # the parser dies with a misleading "mismatched input 'WHERE'" pointing at
         # the start of the clause. Verified: `:like` fails, `:pat` parses.
