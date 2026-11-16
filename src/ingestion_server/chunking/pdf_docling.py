@@ -331,6 +331,8 @@ def scan_pdf(
     slides: bool = False,
     word_space_factor: float | None = None,
     tables: str | None = None,
+    slide_layout: str | None = None,
+    furniture: dict[str, list[str]] | None = None,
 ) -> list[MdChunk]:
     """Convert one PDF (or DOCX / PPTX / HTML) into MdChunk instances.
 
@@ -739,6 +741,16 @@ def scan_pdf(
     # Any other PDF laid out as boxes (a marketing leaflet, a one-page product sheet) fragments the same way
     # (Cortex, 2026-10-14: leaflets of 9 passages with 8 under 200 characters): a page whose text chunks are short
     # gets the same roll-up; a page of long passages (a Word document's rendering) is left alone.
+    # A slide of numbered cards (an agenda: "01" over "Introdução à formação", "02" over ..., in a grid): Docling reads
+    # it down the columns and took one column of coloured boxes for a picture, so its passages ran "01, 05, 09, 03,
+    # 07, ..." and "02 06 10 13" apart from their titles (Cortex register #460, 2026-11-16). Such a slide becomes one
+    # passage, its cards in their numbers' order, each number with its title (_numbered_cards).
+    # With `slide_layout` (models.Chunking): the vision model orders every slide's text and names its page furniture
+    # first (_with_slide_layout); the numbered-card rule then covers the slides it left as they were or could not read.
+    if page_headings is not None:
+        chunks, done = _with_slide_layout(doc, chunks, page_headings, _chunker.tokenizer, rel_path, abs_path,
+                                          slide_layout, chunker=_chunker, given=furniture)
+        chunks = _with_numbered_cards(doc, chunks, page_headings, _chunker.tokenizer, rel_path, skip=done)
     chunks = _slide_rollups(chunks, _chunker.tokenizer, page_headings if page_headings is not None else _SlideHeadings(),
                             fragmented_only=page_headings is None)
 
@@ -785,6 +797,420 @@ def _slide_text(c: MdChunk, heads: list[str]) -> str:
 
 
 FRAGMENT_CHARS = 400          # a page whose text chunks average under this is "fragmented" (a leaflet, a slide)
+MIN_CARDS = 3                 # numbered cards that make a slide an agenda / card grid (_numbered_cards)
+
+
+def _label_number(text: str) -> int | None:
+    """A card's number: "01", "7", "12." - one to three digits, nothing else. None for any other text."""
+    t = text.strip().rstrip('.)').strip()
+    return int(t) if t and len(t) <= 3 and t.isdigit() else None
+
+
+def _numbered_cards(doc, page_headings) -> dict[int, tuple[list[tuple[str, list[float]]], list[str]]]:
+    """Per slide with MIN_CARDS numbers or more each over its own title: ([("01 Introdução à formação", box), ...] in
+    the numbers' order, [the slide's other words, in Docling's order]). A card is a number box with a text box right
+    under it - overlapping it across, its top within one and a half of the number's height below - the nearest such.
+    Every text of the page counts, the text Docling nests in pictures too (a column of coloured boxes it took for a
+    picture held 02, 06, 10, 13 and their titles). Headings and page furniture (the "Informação Interna" footer, a
+    slide number) are not cards nor other words. Plain string and box arithmetic, no patterns."""
+    items = _slide_items(doc, page_headings)
+    out: dict[int, tuple[list[tuple[str, list[float]]], list[str]]] = {}
+    for page, texts in items.items():
+        cards = _cards_of(texts)
+        if cards is not None:
+            out[page] = cards
+    return out
+
+
+def _slide_items(doc, page_headings, chunker=None) -> dict[int, list[tuple[str, list[float]]]]:
+    """Each slide's text boxes, in Docling's order: (text, box) - the text it nests in pictures too, and with `chunker`
+    its tables, each written as the chunker writes it (its serializer: a table's rows as triples, a list item with its
+    marker "- b) ..."); not its headings (the passage opens with them) nor what Docling marked as page furniture.
+    Measured 2026-11-16 on the 23 presentations: built from the boxes' bare text, the slide passages lost every table
+    (the C4 deck's summary, the rates of the Depósitos a Prazo guide) and the lists' "a)", "b)", "iv."."""
+    from docling_core.types.doc import DocItemLabel
+
+    furniture = _furniture(doc)
+    ser = None
+    if chunker is not None:
+        try:
+            ser = chunker.serializer_provider.get_serializer(doc)
+        except Exception:  # noqa: BLE001 - the boxes' bare text then
+            ser = None
+    items: dict[int, list[tuple[str, list[float]]]] = {}
+    for item, _level in doc.iterate_items(traverse_pictures=True):
+        label = getattr(item, 'label', None)
+        if label == DocItemLabel.PICTURE:
+            continue
+        # a heading is the passage's first line when it is one of the slide's headings; one that is not (the Guia de
+        # Depósitos' "Capitalização", lost so, 2026-11-16) stays as the slide's text
+        is_heading = label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE)
+        if label == DocItemLabel.TABLE and ser is None:
+            continue
+        text = ' '.join((getattr(item, 'text', '') or '').split())
+        if ser is not None and (label in (DocItemLabel.TABLE, DocItemLabel.LIST_ITEM) or not text):
+            try:
+                text = (ser.serialize(item=item).text or '').strip() or text
+            except Exception:  # noqa: BLE001 - the bare text then
+                pass
+        page, bb = _first_prov(item)
+        if not text or page is None or bb is None:
+            continue
+        # the footer: this item itself, or (words, not a number) a text seen as a footer anywhere. A card's "11" is not
+        # slide 11's page number though the two read the same (the Agenda lost its cards 11 and 12 so, 2026-11-16)
+        if str(getattr(getattr(item, 'content_layer', None), 'value', '')) == 'furniture':
+            continue
+        if text in furniture and _label_number(text) is None:
+            continue
+        if text in (page_headings.get(page) or []):
+            continue
+        if is_heading and (_plain_heading(text) in (page_headings.get(page) or [])
+                           or (page, _plain_heading(text)) in getattr(page_headings, 'aliases', {})):
+            continue
+        items.setdefault(page, []).append((text, bb))
+    return items
+
+
+def _cards_of(texts: list[tuple[str, list[float]]]) -> tuple[list[tuple[str, list[float]]], list[str]] | None:
+    """A slide's numbered cards (see _numbered_cards), or None when it has fewer than MIN_CARDS."""
+    # boxes as (left, upper, right, lower) whichever way the page's y axis runs
+    box = [(min(b[0], b[2]), max(b[1], b[3]), max(b[0], b[2]), min(b[1], b[3])) for _, b in texts]
+    used: set[int] = set()
+    cards: list[tuple[int, str, list[float]]] = []
+    for i, (text, _b) in enumerate(texts):
+        n = _label_number(text)
+        if n is None:
+            continue
+        l, up, r, lo = box[i]
+        height = up - lo
+        best = None
+        for j, (other, _o) in enumerate(texts):
+            if j == i or j in used or _label_number(other) is not None:
+                continue
+            ol, oup, or_, olo = box[j]
+            gap = lo - oup                              # how far under the number its top is
+            if min(r, or_) - max(l, ol) <= 0 or gap < -0.25 * height or gap > 1.5 * height:
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, j)
+        if best is None:
+            continue
+        j = best[1]
+        used.update((i, j))
+        ol, oup, or_, olo = box[j]
+        cards.append((n, f"{text} {texts[j][0]}", [min(l, ol), max(up, oup), max(r, or_), min(lo, olo)]))
+    if len(cards) < MIN_CARDS:
+        return None
+    cards.sort(key=lambda c: c[0])
+    other = [t for k, (t, _b) in enumerate(texts) if k not in used]
+    return [(t, b) for _, t, b in cards], other
+
+
+def _slide_passage(page: int, page_headings, lines: list[tuple[str, list[float] | None]], tokenizer,
+                   rel_path: str) -> MdChunk | None:
+    """One passage for a slide: its headings, then `lines` (text, box) one a line; a region per box. None when it would
+    be too long for a passage (the slide keeps its fragments)."""
+    heads = list(page_headings.get(page) or [])
+    text = (' > '.join(heads) + '\n\n' if heads else '') + '\n'.join(t for t, _ in lines)
+    if len(text) > _MAX_CHUNK_CHARS or not lines:
+        return None
+    regions = [{'page_no': page, 'bbox': b} for _, b in lines if b]
+    return MdChunk(
+        doc_path=rel_path, chunk_index=0, section_path=' > '.join(_slide_chain(page_headings, page, None)) or '(root)',
+        text=text, token_count=tokenizer.count_tokens(text), page_no=page, bbox=regions[0]['bbox'] if regions else None,
+        regions=regions or None, section_level=None, kind='text', caption_for=None)
+
+
+def _replace_slides(chunks: list[MdChunk], made: dict[int, MdChunk]) -> list[MdChunk]:
+    """The chunks with each page in `made` having its text passages (Docling's fragments, the text of its pictures, the
+    roll-up material) give way to its one passage; its tables and other chunks stay."""
+    def given_way(c: MdChunk) -> bool:
+        pages = {r.get('page_no') for r in (c.regions or [])} or {c.page_no}
+        return c.kind == 'text' and c.page_no in made and pages <= {c.page_no}
+    out = [c for c in chunks if not given_way(c)] + [made[p] for p in sorted(made)]
+    for i, c in enumerate(out):
+        c.chunk_index = i
+    return out
+
+
+def _with_numbered_cards(doc, chunks: list[MdChunk], page_headings, tokenizer, rel_path: str,
+                         skip: set[int] = frozenset()) -> list[MdChunk]:
+    """The chunks with each numbered-card slide (not in `skip`: the vision model ordered it already) as one passage:
+    its headings, its cards in order, its other words; one region per card."""
+    made: dict[int, MdChunk] = {}
+    counts = []
+    for page, (ordered, other) in sorted(_numbered_cards(doc, page_headings).items()):
+        if page in skip:
+            continue
+        passage = _slide_passage(page, page_headings, ordered + [(t, None) for t in other], tokenizer, rel_path)
+        if passage:
+            made[page] = passage
+            counts.append(len(ordered))
+    if not made:
+        return chunks
+    logger.info('numbered-card slides: %d (%s cards)', len(made), ', '.join(map(str, counts)))
+    return _replace_slides(chunks, made)
+
+
+SLIDE_WIDTH = 1280            # the slide's picture for the vision model, in pixels across
+FOOTER_MAX = 40               # a text this short that repeats on most slides is the deck's footer, not content
+FOOTER_SHARE = 0.5            # ... on at least this share of the slides (and three of them)
+
+
+def _slide_jpeg(pdf, page: int) -> bytes:
+    import io
+    pg = pdf[page - 1]
+    img = pg.render(scale=SLIDE_WIDTH / pg.get_width()).to_pil().convert('RGB')
+    buf = io.BytesIO()
+    img.save(buf, 'JPEG', quality=88)
+    return buf.getvalue()
+
+
+MARGIN = 0.12                 # the share of a page's height at its top and bottom where a page number stands
+
+
+def _deck_furniture(items: dict[int, list[tuple[str, list[float]]]], heights: dict[int, float] | None = None,
+                    given: dict[str, list[str]] | None = None) -> dict[int, set[int]]:
+    """Per slide, the boxes that are page furniture. `given` (the .pptx's own: its template's texts, its footer, date
+    and slide-number placeholders - Cortex's slide_furniture): a box whose text is one of its page's, or is made only of
+    their words (Docling merging a slide number and a footer into one box). Always: a number that is the page's own, in
+    its top or bottom margin. Without `given` (a presentation's PDF): also a short text that stands in a margin of most
+    pages - in the margins only: a repeated text in the middle of a slide is content ("Conta Poupança Livre" on 7
+    screenshots of an application, taken for a footer when the margins were not asked, 2026-11-16)."""
+    def margin(page: int, b: list[float]) -> bool:
+        h = (heights or {}).get(page)
+        if not h:
+            return False
+        lo, up = min(b[1], b[3]), max(b[1], b[3])           # PDF space: y grows upwards
+        return lo < MARGIN * h or up > (1 - MARGIN) * h
+    footers: set[str] = set()
+    if not given:
+        count: dict[str, int] = {}
+        for page, boxes in items.items():
+            for t in {t for t, b in boxes if len(t) <= FOOTER_MAX and margin(page, b)}:
+                count[t] = count.get(t, 0) + 1
+        slides = max(1, len(items))
+        footers = {t for t, n in count.items() if n >= 3 and n >= FOOTER_SHARE * slides}
+    out: dict[int, set[int]] = {}
+    for page, boxes in items.items():
+        theirs = {_norm(t) for t in (given or {}).get(str(page), [])}
+        words = {w for t in theirs for w in t.split()}
+        drop = set()
+        for k, (t, b) in enumerate(boxes):
+            n = _norm(t)
+            if n in theirs or (theirs and len(t) <= FOOTER_MAX and n.split() and set(n.split()) <= words):
+                drop.add(k)
+            elif _label_number(t[2:] if t.startswith('- ') else t) == page and margin(page, b):
+                # the page's own number in its margin ("02" in the Agenda's middle is not), a list item's too ("- 3":
+                # the Conta Biz deck's page number, docling's list item, 2026-11-16)
+                drop.add(k)
+            elif t in footers and margin(page, b):
+                drop.add(k)
+        out[page] = drop
+    return out
+
+
+def _norm(text: str) -> str:
+    return ' '.join(''.join({'–': '-', '—': '-', '’': "'", '‘': "'", '“': '"', '”': '"'}.get(c, c)
+                            for c in (text or '').lower()).split())
+
+
+def _find_word(hay: str, needle: str, start: int, taken: set[int]) -> int:
+    """The first place at or after `start` where `needle` stands in `hay` as whole words, not at a place taken."""
+    at = start
+    while True:
+        i = hay.find(needle, at)
+        if i < 0:
+            return -1
+        before = hay[i - 1] if i > 0 else ' '
+        after = hay[i + len(needle)] if i + len(needle) < len(hay) else ' '
+        if not before.isalnum() and not after.isalnum() and i not in taken:
+            return i
+        at = i + 1
+
+
+def _squash(text: str) -> str:
+    """Letters and digits only, lower case: how a box and a transcription are compared - spaces, punctuation and bullet
+    glyphs (the fonts' private "\uf0a7", "❑") are written differently by the two, and a PDF's text layer glues words
+    ("OCliente preenche" for "O Cliente preenche")."""
+    return ''.join(c for c in _norm(text) if c.isalnum())
+
+
+SHORT = 4                     # a box this short (squashed) is matched as a whole word only: "01", "3", "i"
+
+
+def _transcription_order(boxes: list[tuple[str, list[float]]], skip: set[int], transcript: str) -> list[int]:
+    """The boxes (not those in `skip`) in the order the transcription has their words: each box placed where its text
+    - whole, else its first characters - first stands in the transcription, unclaimed, compared on letters and digits
+    only (_squash); a short box as a whole word. A box not found there (text the transcription leaves out: an
+    application's controls on a screenshot, an icon's letter) keeps its place after the box before it in Docling's
+    order. Only positions come from the transcription, never words. Measured 2026-11-16 on the 23 presentations: compared
+    as written, 612 boxes were not found (bullet glyphs, glued words, a list marker - slide 20's "EXCEÇÃO" ended after
+    its two items, register #464)."""
+    flat = _norm(transcript)
+    hay = _squash(transcript)
+    taken: set[int] = set()
+    taken_flat: set[int] = set()
+    pos: dict[int, float] = {}
+
+    def first_free(needle: str) -> int:
+        at = 0
+        while True:
+            i = hay.find(needle, at)
+            if i < 0 or i not in taken:
+                return i
+            at = i + 1
+    for k, (text, _b) in enumerate(boxes):
+        if k in skip:
+            continue
+        bare = text[2:] if text.startswith('- ') else text
+        sq = _squash(bare)
+        if not sq:
+            continue
+        if len(sq) < SHORT:
+            i = _find_word(flat, _norm(bare), 0, taken_flat)
+            if i >= 0:
+                taken_flat.add(i)
+                # its place in the squashed transcription: the letters before it there
+                pos[k] = float(len(_squash(flat[:i])))
+            continue
+        i = first_free(sq)
+        if i < 0 and len(sq) > 24:
+            i = first_free(sq[:24])
+        if i >= 0:
+            pos[k] = float(i)
+            taken.add(i)
+    last = -1.0
+    for k in range(len(boxes)):
+        if k in skip:
+            continue
+        if k in pos:
+            last = pos[k]
+        else:
+            last += 0.001
+            pos[k] = last
+    return sorted(pos, key=lambda k: (pos[k], k))
+
+
+def _transcribe(preset: str, jpeg: bytes) -> str | None:
+    """The vision model's transcription of a slide in reading order, or None when it gives none."""
+    import base64
+
+    import httpx
+
+    from ..config import settings
+
+    body = {'model': preset, 'stream': False, 'messages': [{'role': 'user', 'content': [
+        {'type': 'text', 'text': 'Transcribe this slide.'},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(jpeg).decode()}}]}]}
+    try:
+        r = httpx.post(f'{settings.agent_server_url}/v1/chat/completions', json=body, timeout=120)
+        r.raise_for_status()
+        content = (r.json()['choices'][0]['message']['content'] or '').strip()
+    except Exception as e:  # noqa: BLE001 - this slide keeps Docling's order; said in the log
+        logger.warning('slide layout: no transcription (%s: %s)', type(e).__name__, str(e)[:200])
+        return None
+    if '</think>' in content:
+        content = content.rsplit('</think>', 1)[1]
+    return content.strip() or None
+
+
+def _slide_lines(boxes: list[tuple[str, list[float]]], order: list[int]) -> list[tuple[str, list[float] | None]]:
+    """The boxes in `order`, one a line, a number box joined to the box after it ("03 Tipos de conflitos de
+    interesses"); each box keeps its region."""
+    def bare(t: str) -> str:                     # a list item's text without its marker ("- 3" -> "3")
+        return t[2:] if t.startswith('- ') else t
+    lines: list[tuple[str, list[float] | None]] = []
+    k = 0
+    while k < len(order):
+        text, box = boxes[order[k]]
+        if (_label_number(bare(text)) is not None and k + 1 < len(order)
+                and _label_number(bare(boxes[order[k + 1]][0])) is None):
+            nxt_text, nxt_box = boxes[order[k + 1]]
+            lines.append((f'{text} {bare(nxt_text)}', box))
+            lines.append(('', nxt_box))
+            k += 2
+            continue
+        lines.append((text, box))
+        k += 1
+    return lines
+
+
+def _with_slide_layout(doc, chunks: list[MdChunk], page_headings, tokenizer, rel_path: str, abs_path: str,
+                       preset: str | None, chunker=None, given: dict[str, list[str]] | None = None
+                       ) -> tuple[list[MdChunk], set[int]]:
+    """Every slide's text as passages of its own, from its own boxes (Docling's chunks could run across slides: slide
+    2's ended with slide 3's footer and section number, "3 Informação Interna 01"), the deck's furniture left out
+    (_deck_furniture), in the order the vision model (`preset`) reads the slide (_transcribe, _transcription_order);
+    without a preset or an answer, Docling's order. A numbered-card slide the model could not read is left to the
+    card rule. Returns the chunks and the pages the model read."""
+    import pypdfium2 as pdfium
+
+    items = _slide_items(doc, page_headings, chunker)
+    heights = {}
+    for no, pg in (getattr(doc, 'pages', None) or {}).items():
+        try:
+            heights[int(no)] = float(pg.size.height)
+        except Exception:  # noqa: BLE001 - a page without a size: its numbers are never taken for the page number
+            pass
+    furniture = _deck_furniture(items, heights, given)
+    pdf = pdfium.PdfDocument(abs_path) if preset else None
+    made: dict[int, MdChunk] = {}
+    read: set[int] = set()
+    dropped = 0
+    for page in sorted(set(items) | set(page_headings)):
+        boxes = items.get(page) or []
+        skip = furniture.get(page, set())
+        dropped += len(skip)
+        order = [k for k in range(len(boxes)) if k not in skip]
+        if preset and len(order) >= 2 and pdf is not None and page <= len(pdf):
+            transcript = _transcribe(preset, _slide_jpeg(pdf, page))
+            if transcript:
+                order = _transcription_order(boxes, skip, transcript)
+                read.add(page)
+            elif _cards_of([boxes[k] for k in order]) is not None:
+                continue                                 # the card rule orders it
+        lines = [(t, b) for t, b in _slide_lines(boxes, order)]
+        text_lines = [(t, b) for t, b in lines if t]
+        # long slides in passages that fit, each with its own boxes' regions
+        parts: list[list[tuple[str, list[float] | None]]] = [[]]
+        size = 0
+        for t, b in lines:
+            if t and size + len(t) > _MAX_CHUNK_CHARS // 2 and parts[-1]:
+                parts.append([])
+                size = 0
+            parts[-1].append((t, b))
+            size += len(t)
+        made_here = []
+        for part in parts:
+            passage = _slide_passage(page, page_headings, [(t, b) for t, b in part if t], tokenizer, rel_path)
+            if passage:
+                passage.regions = [{'page_no': page, 'bbox': b} for _, b in part if b] or passage.regions
+                made_here.append(passage)
+        if not text_lines and page_headings.get(page):
+            heads = ' > '.join(page_headings[page])  # a slide with its title only: a passage with its title
+            made_here.append(MdChunk(doc_path=rel_path, chunk_index=0, section_path=' > '.join(
+                _slide_chain(page_headings, page, None)) or '(root)', text=heads, token_count=tokenizer.count_tokens(heads),
+                page_no=page, bbox=None, regions=None, section_level=None, kind='text', caption_for=None))
+        if made_here:
+            made[page] = made_here
+    if pdf is not None:
+        pdf.close()
+    logger.info('slide passages: %d slides, %d read by %s, %d furniture boxes left out', len(made), len(read),
+                preset or 'no model', dropped)
+    return _replace_slide_text(chunks, made), set(made)
+
+
+def _replace_slide_text(chunks: list[MdChunk], made: dict[int, list[MdChunk]]) -> list[MdChunk]:
+    """The chunks with every text chunk that touches a slide in `made` given way to that slide's own passages (a chunk
+    across two slides goes: both have their own); tables and other chunks stay."""
+    def touches(c: MdChunk) -> bool:
+        pages = {r.get('page_no') for r in (c.regions or [])} | ({c.page_no} if c.page_no is not None else set())
+        return c.kind == 'text' and bool(pages & set(made))
+    out = [c for c in chunks if not touches(c)] + [p for page in sorted(made) for p in made[page]]
+    for i, c in enumerate(out):
+        c.chunk_index = i
+    return out
 
 
 def _slide_rollups(chunks: list[MdChunk], tokenizer, page_headings, fragmented_only: bool = False) -> list[MdChunk]:

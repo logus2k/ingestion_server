@@ -22,7 +22,8 @@ from .pdf_docling import scan_pdf
 
 
 def scan(path: str, target_tokens: int = 200, slides: bool = False,
-         word_space_factor: float | None = None, tables: str | None = None) -> list[Chunk]:
+         word_space_factor: float | None = None, tables: str | None = None,
+         slide_layout: str | None = None, furniture: dict[str, list[str]] | None = None) -> list[Chunk]:
     import os
     # The parser reads its target from the environment (it predates the service's
     # config); set it here so `chunking.target_tokens` in the pipeline wins.
@@ -30,7 +31,7 @@ def scan(path: str, target_tokens: int = 200, slides: bool = False,
 
     # slides: a presentation (models.Chunking.slides) - opt-in, so the tuned default path is unchanged
     raw = scan_pdf(path, repo_root=os.path.dirname(path), slides=slides, word_space_factor=word_space_factor,
-                   tables=tables)
+                   tables=tables, slide_layout=slide_layout, furniture=furniture)
     out: list[Chunk] = []
     for c in raw:
         out.append(Chunk(

@@ -88,6 +88,18 @@ class Chunking(BaseModel):
     # "markdown": the table's rows as Markdown (a header row, then one line per row, the header repeated when a table
     # spans passages).
     tables: str | None = None
+    # Opt-in, `pdf_docling` with `slides` only: the agent_server preset (a vision model) that puts each slide's text in
+    # the order a person reads the slide and names its page furniture (the slide number, a footer repeated on every
+    # slide). It is given the slide's picture and its text boxes numbered; it answers only with their numbers - the
+    # passage is built from the boxes' own words, so nothing is added or altered (Cortex register #460, 2026-11-16: a
+    # grid Agenda read down its columns, slide numbers and "Informação Interna" taken for content). None: off.
+    slide_layout: str | None = None
+    # Opt-in, `pdf_docling` with `slides` only: each page's furniture as the presentation itself says it - {"<page>":
+    # [texts]}: the texts its template draws on every slide (a master's "Informação Interna", the slide-number field as
+    # that slide's number) and its footer, date and slide-number placeholders, read by the caller from the .pptx. Those
+    # texts are left out of the slides' passages. None: furniture by position only (a page's number in its margin, a
+    # short text in the margins of most pages).
+    furniture: dict[str, list[str]] | None = None
 
 
 class IndexField(BaseModel):
