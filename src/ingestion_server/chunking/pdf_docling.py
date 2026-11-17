@@ -188,6 +188,14 @@ def _ensure_loaded() -> None:
 
 
 _ocr_converter = None
+
+
+def unload() -> None:
+    """Drop docling's converters (their layout, table and OCR models on the GPU); the next conversion builds them again.
+    Called by gpu_memory.release(unload=True) under the conversion lock, so never during a conversion."""
+    global _converter, _ocr_converter
+    _converter = None
+    _ocr_converter = None
 # A scanned/image PDF extracts to near-empty text when do_ocr is off. Below
 # this many characters we treat the extraction as failed and retry with OCR.
 _OCR_FALLBACK_MIN_CHARS = int(os.environ.get('DOCLING_OCR_FALLBACK_MIN_CHARS', '500'))

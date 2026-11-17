@@ -66,9 +66,12 @@ def configure(release_when_idle: bool | None = None, idle_seconds: int | None = 
     return snapshot()
 
 
-def release(asked: bool = False) -> float | None:
+def release(asked: bool = False, unload: bool = False) -> float | None:
     """Hand the free blocks back; None when a conversion holds the lock (tried again later). MiB given back. `asked`:
-    by POST /v1/admin/gpu-memory/release (Cortex's GPU ledger), not by the idle clock."""
+    by POST /v1/admin/gpu-memory/release (Cortex's GPU ledger), not by the idle clock. `unload`: docling's models too
+    (pdf_docling.unload: the converters dropped, rebuilt by the next conversion as after a start) - asked by Cortex's
+    ledger before a Movies render: kept loaded, they held ~1.3 GB of the card after any conversion and renders were
+    refused for want of 1 GB (Cortex register #468, 2026-11-16)."""
     t = _torch()
     if t is None:
         _released[0] = True
@@ -78,6 +81,9 @@ def release(asked: bool = False) -> float | None:
         return None
     try:
         before = t.cuda.memory_reserved()
+        if unload:
+            from .chunking import pdf_docling
+            pdf_docling.unload()
         gc.collect()
         t.cuda.empty_cache()
         freed = (before - t.cuda.memory_reserved()) / 2**20
@@ -86,8 +92,9 @@ def release(asked: bool = False) -> float | None:
             lock.release()
     _released[0] = True
     _total_released_mib[0] += max(0.0, freed)
-    logger.info("gpu memory: %s, %.0f MiB given back to the card (%.0f MiB still reserved)",
-                "asked" if asked else f"idle {time.monotonic() - _last_use[0]:.0f} s", freed, t.cuda.memory_reserved() / 2**20)
+    logger.info("gpu memory: %s%s, %.0f MiB given back to the card (%.0f MiB still reserved)",
+                "asked" if asked else f"idle {time.monotonic() - _last_use[0]:.0f} s", ", models unloaded" if unload else "",
+                freed, t.cuda.memory_reserved() / 2**20)
     return freed
 
 
