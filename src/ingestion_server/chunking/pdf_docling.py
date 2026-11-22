@@ -830,12 +830,16 @@ def _numbered_cards(doc, page_headings) -> dict[int, tuple[list[tuple[str, list[
     return out
 
 
-def _slide_items(doc, page_headings, chunker=None) -> dict[int, list[tuple[str, list[float]]]]:
+def _slide_items(doc, page_headings, chunker=None, inner_headings: bool = False) -> dict[int, list[tuple[str, list[float]]]]:
     """Each slide's text boxes, in Docling's order: (text, box) - the text it nests in pictures too, and with `chunker`
     its tables, each written as the chunker writes it (its serializer: a table's rows as triples, a list item with its
     marker "- b) ..."); not its headings (the passage opens with them) nor what Docling marked as page furniture.
     Measured 2026-11-16 on the 23 presentations: built from the boxes' bare text, the slide passages lost every table
-    (the C4 deck's summary, the rates of the Depósitos a Prazo guide) and the lists' "a)", "b)", "iv."."""
+    (the C4 deck's summary, the rates of the Depósitos a Prazo guide) and the lists' "a)", "b)", "iv.".
+    inner_headings: only the slide's title chain (_slide_chain) is left out; its other headings stay as boxes in their
+    place, each over its own items - a wrapped heading as one box, at its first line's place. Cortex register #466,
+    2026-11-18: a slide of sub-headings ("Reais:" / "Potenciais:" over their own lists) became a passage that opened
+    with every heading joined ("A > Reais: > Potenciais:") and then every item, none under its own heading."""
     from docling_core.types.doc import DocItemLabel
 
     furniture = _furniture(doc)
@@ -846,6 +850,7 @@ def _slide_items(doc, page_headings, chunker=None) -> dict[int, list[tuple[str, 
         except Exception:  # noqa: BLE001 - the boxes' bare text then
             ser = None
     items: dict[int, list[tuple[str, list[float]]]] = {}
+    joined: set[tuple[int, str]] = set()             # (page, wrapped heading) already placed as a box
     for item, _level in doc.iterate_items(traverse_pictures=True):
         label = getattr(item, 'label', None)
         if label == DocItemLabel.PICTURE:
@@ -869,6 +874,21 @@ def _slide_items(doc, page_headings, chunker=None) -> dict[int, list[tuple[str, 
         if str(getattr(getattr(item, 'content_layer', None), 'value', '')) == 'furniture':
             continue
         if text in furniture and _label_number(text) is None:
+            continue
+        if inner_headings:
+            lead = _slide_chain(page_headings, page, None)
+            plain = _plain_heading(text)
+            whole = getattr(page_headings, 'aliases', {}).get((page, plain), plain)
+            if text in lead or (is_heading and whole in lead):
+                continue
+            if is_heading and whole != plain:            # one line of a wrapped heading: the whole heading, once
+                if (page, whole) in joined:
+                    continue
+                joined.add((page, whole))
+                text = whole
+            elif is_heading:
+                text = plain
+            items.setdefault(page, []).append((text, bb))
             continue
         if text in (page_headings.get(page) or []):
             continue
@@ -915,10 +935,10 @@ def _cards_of(texts: list[tuple[str, list[float]]]) -> tuple[list[tuple[str, lis
 
 
 def _slide_passage(page: int, page_headings, lines: list[tuple[str, list[float] | None]], tokenizer,
-                   rel_path: str) -> MdChunk | None:
-    """One passage for a slide: its headings, then `lines` (text, box) one a line; a region per box. None when it would
-    be too long for a passage (the slide keeps its fragments)."""
-    heads = list(page_headings.get(page) or [])
+                   rel_path: str, heads: list[str] | None = None) -> MdChunk | None:
+    """One passage for a slide: its headings (`heads`, else all the slide's), then `lines` (text, box) one a line; a
+    region per box. None when it would be too long for a passage (the slide keeps its fragments)."""
+    heads = list(heads) if heads is not None else list(page_headings.get(page) or [])
     text = (' > '.join(heads) + '\n\n' if heads else '') + '\n'.join(t for t, _ in lines)
     if len(text) > _MAX_CHUNK_CHARS or not lines:
         return None
@@ -1047,16 +1067,29 @@ def _squash(text: str) -> str:
 SHORT = 4                     # a box this short (squashed) is matched as a whole word only: "01", "3", "i"
 
 
-def _transcription_order(boxes: list[tuple[str, list[float]]], skip: set[int], transcript: str) -> list[int]:
+def _transcription_order(boxes: list[tuple[str, list[float]]], skip: set[int], transcript: str,
+                         lead: list[str] | tuple = ()) -> list[int]:
     """The boxes (not those in `skip`) in the order the transcription has their words: each box placed where its text
     - whole, else its first characters - first stands in the transcription, unclaimed, compared on letters and digits
     only (_squash); a short box as a whole word. A box not found there (text the transcription leaves out: an
     application's controls on a screenshot, an icon's letter) keeps its place after the box before it in Docling's
     order. Only positions come from the transcription, never words. Measured 2026-11-16 on the 23 presentations: compared
     as written, 612 boxes were not found (bullet glyphs, glued words, a list marker - slide 20's "EXCEÇÃO" ended after
-    its two items, register #464)."""
+    its two items, register #464).
+    `lead`: the slide's title chain, not among the boxes - its first place in the transcription is no box's (Cortex
+    register #466, 2026-11-18: the sub-heading "Fornecedores e Parcerias" was placed inside the title "Pessoas
+    Relacionadas, Fornecedores e Parcerias", before the items of the sub-heading above it)."""
     flat = _norm(transcript)
     hay = _squash(transcript)
+    plain = flat                                     # unmasked, the same length: places are counted on it
+    for h in lead:
+        sq, nh = _squash(h), _norm(h)
+        if len(sq) >= SHORT and sq in hay:
+            i = hay.find(sq)
+            hay = hay[:i] + '#' * len(sq) + hay[i + len(sq):]
+        if nh and nh in flat:
+            i = flat.find(nh)
+            flat = flat[:i] + '#' * len(nh) + flat[i + len(nh):]
     taken: set[int] = set()
     taken_flat: set[int] = set()
     pos: dict[int, float] = {}
@@ -1080,7 +1113,7 @@ def _transcription_order(boxes: list[tuple[str, list[float]]], skip: set[int], t
             if i >= 0:
                 taken_flat.add(i)
                 # its place in the squashed transcription: the letters before it there
-                pos[k] = float(len(_squash(flat[:i])))
+                pos[k] = float(len(_squash(plain[:i])))
             continue
         i = first_free(sq)
         if i < 0 and len(sq) > 24:
@@ -1123,6 +1156,50 @@ def _transcribe(preset: str, jpeg: bytes) -> str | None:
     return content.strip() or None
 
 
+def _heads_over_their_items(boxes: list[tuple[str, list[float]]], order: list[int], heads: set[int]) -> list[int]:
+    """`order` with each run of headings read one after another (a row of column titles read across: "Reais | Potenciais
+    | Presumidos", then their texts) given their own boxes: after each heading, the boxes that stand under it - across
+    its width, below it, above the next heading under it - in their order. A box under two headings of the run (a line
+    across the columns) is no one's and keeps its place; a run where some heading has no box under it is left as it is.
+    Cortex register #466, 2026-11-18: three column titles over their three texts were read as a row, then the texts."""
+    def edges(k):                                       # (left, top, right, bottom), y up (PDF space)
+        b = boxes[k][1]
+        return min(b[0], b[2]), max(b[1], b[3]), max(b[0], b[2]), min(b[1], b[3])
+
+    def under(h, k) -> bool:
+        hl, ht, hr, hb = edges(h)
+        l, t, r, b = edges(k)
+        if min(hr, r) - max(hl, l) <= 0 or t > hb + 0.5 * (ht - hb):
+            return False                                # not in its column, or not below it
+        # no other heading between them in that column
+        return not any(o != h and (lambda ol, ot, or_, ob: min(hr, or_) - max(hl, ol) > 0 and ob >= t and ot <= hb)(*edges(o))
+                       for o in heads)
+    out = list(order)
+    i = 0
+    while i < len(out) - 1:
+        if not (out[i] in heads and out[i + 1] in heads):
+            i += 1
+            continue
+        j = i
+        while j < len(out) and out[j] in heads:
+            j += 1
+        run = out[i:j]
+        rest = [k for k in out if k not in heads]
+        mine = {h: [k for k in rest if under(h, k)] for h in run}
+        shared = {k for h in run for k in mine[h] if sum(k in mine[g] for g in run) > 1}
+        mine = {h: [k for k in mine[h] if k not in shared] for h in run}
+        if not all(mine.values()):
+            i = j
+            continue
+        claimed = {k for h in run for k in mine[h]}
+        block = [x for h in run for x in [h] + mine[h]]
+        before = [k for k in out[:i] if k not in claimed]
+        after = [k for k in out[j:] if k not in claimed]
+        out = before + block + after
+        i = len(before) + len(block)
+    return out
+
+
 def _slide_lines(boxes: list[tuple[str, list[float]]], order: list[int]) -> list[tuple[str, list[float] | None]]:
     """The boxes in `order`, one a line, a number box joined to the box after it ("03 Tipos de conflitos de
     interesses"); each box keeps its region."""
@@ -1154,7 +1231,7 @@ def _with_slide_layout(doc, chunks: list[MdChunk], page_headings, tokenizer, rel
     card rule. Returns the chunks and the pages the model read."""
     import pypdfium2 as pdfium
 
-    items = _slide_items(doc, page_headings, chunker)
+    items = _slide_items(doc, page_headings, chunker, inner_headings=True)
     heights = {}
     for no, pg in (getattr(doc, 'pages', None) or {}).items():
         try:
@@ -1174,10 +1251,13 @@ def _with_slide_layout(doc, chunks: list[MdChunk], page_headings, tokenizer, rel
         if preset and len(order) >= 2 and pdf is not None and page <= len(pdf):
             transcript = _transcribe(preset, _slide_jpeg(pdf, page))
             if transcript:
-                order = _transcription_order(boxes, skip, transcript)
+                order = _transcription_order(boxes, skip, transcript, lead=_slide_chain(page_headings, page, None))
                 read.add(page)
             elif _cards_of([boxes[k] for k in order]) is not None:
                 continue                                 # the card rule orders it
+        inner = set((page_headings.get(page) or [])) - set(_slide_chain(page_headings, page, None))
+        inner |= {w for (pg, _f), w in getattr(page_headings, 'aliases', {}).items() if pg == page} - set(_slide_chain(page_headings, page, None))
+        order = _heads_over_their_items(boxes, order, {k for k in order if boxes[k][0] in inner})
         lines = [(t, b) for t, b in _slide_lines(boxes, order)]
         text_lines = [(t, b) for t, b in lines if t]
         # long slides in passages that fit, each with its own boxes' regions
@@ -1191,7 +1271,8 @@ def _with_slide_layout(doc, chunks: list[MdChunk], page_headings, tokenizer, rel
             size += len(t)
         made_here = []
         for part in parts:
-            passage = _slide_passage(page, page_headings, [(t, b) for t, b in part if t], tokenizer, rel_path)
+            passage = _slide_passage(page, page_headings, [(t, b) for t, b in part if t], tokenizer, rel_path,
+                                     heads=_slide_chain(page_headings, page, None))
             if passage:
                 passage.regions = [{'page_no': page, 'bbox': b} for _, b in part if b] or passage.regions
                 made_here.append(passage)
